@@ -558,53 +558,72 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── CSV export ───────────────────────────────────────────────────────────
-  const CSV_COLUMNS = Object.freeze([
-    { key: 'id',                          header: 'id' },
-    { key: 'version',                     header: 'version' },
-    { key: 'dateTime',                    header: 'dateTime' },
-    { key: 'deviceId',                    header: 'deviceId' },
-    { key: 'deviceName',                  header: 'deviceName' },
-    { key: 'driverId',                    header: 'driverId' },
-    { key: 'driverName',                  header: 'driverName' },
-    { key: 'productType',                 header: 'productType' },
-    { key: 'volumeLiters',                header: 'volumeLiters' },
-    { key: 'cost',                        header: 'cost' },
-    { key: 'currencyCode',                header: 'currencyCode' },
-    { key: 'odometerKm',                  header: 'odometerKm' },
-    { key: 'siteName',                    header: 'siteName' },
-    { key: 'cardNumber',                  header: 'cardNumber' },
-    { key: 'comments',                    header: 'comments' },
-    { key: 'externalReference',           header: 'externalReference' },
-    { key: 'provider',                    header: 'provider' },
-    { key: 'licencePlate',                header: 'licencePlate' },
-    { key: 'vehicleIdentificationNumber', header: 'vehicleIdentificationNumber' }
+  // Mirrors the native Geotab "Fuel Transactions Import Template" exactly:
+  // identical 16 headers, identical order, identical formatting. Round-trip
+  // record identity is via VIN/Serial/Plate + dateTime on re-import — the
+  // native template carries no `id` column either, and our matcher already
+  // handles that path.
+  const NATIVE_CSV_COLUMNS = Object.freeze([
+    { key: 'Date & Time',                   header: 'Date & Time' },
+    { key: 'Vehicle Identification Number', header: 'Vehicle Identification Number' },
+    { key: 'Serial Number',                 header: 'Serial Number' },
+    { key: 'License Plate',                 header: 'License Plate' },
+    { key: 'Vehicle Description',           header: 'Vehicle Description' },
+    { key: 'Cardholder',                    header: 'Cardholder' },
+    { key: 'Card Number',                   header: 'Card Number' },
+    { key: 'Volume (L)',                    header: 'Volume (L)' },
+    { key: 'Cost',                          header: 'Cost' },
+    { key: 'Currency Code',                 header: 'Currency Code' },
+    { key: 'Product Type',                  header: 'Product Type' },
+    { key: 'Transaction Odometer',          header: 'Transaction Odometer' },
+    { key: 'Location Coordinates',          header: 'Location Coordinates' },
+    { key: 'Location Address',              header: 'Location Address' },
+    { key: 'Site Name',                     header: 'Site Name' },
+    { key: 'Comments',                      header: 'Comments' }
   ]);
+
+  // Local ISO 8601 without "Z" — matches the template example
+  // "2026-02-01T14:30:00". Geotab interprets this column as tenant-local time
+  // on import; emitting the same form keeps the round-trip lossless.
+  function fmtNativeDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+           'T' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+  function fmtCoords(loc) {
+    if (!loc || typeof loc !== 'object') return '';
+    if (typeof loc.y !== 'number' || typeof loc.x !== 'number') return '';
+    return loc.y + ',' + loc.x;     // "lat,lon" per template
+  }
+  function fmtPlainNumber(n) {
+    return (n == null || n === '' || isNaN(n)) ? '' : String(Number(n));
+  }
 
   function exportCsv() {
     if (!ui.rows.length) { setStatus('Nothing to export.', 'error'); return; }
     const data = (ui.selected.size ? ui.rows.filter((r) => ui.selected.has(r.id)) : ui.rows)
       .map((r) => ({
-        id: r.id,
-        version: r.version || '',
-        dateTime: r.dateTime || '',
-        deviceId: deviceIdOf(r) || '',
-        deviceName: (deviceIdOf(r) && ui.deviceById.get(deviceIdOf(r))) || r.description || '',
-        driverId: driverIdOf(r) || '',
-        driverName: r.driverName || (driverIdOf(r) && ui.driverById.get(driverIdOf(r))) || '',
-        productType: r.productType || '',
-        volumeLiters: r.volume != null ? r.volume : '',
-        cost: r.cost != null ? r.cost : '',
-        currencyCode: r.currencyCode || '',
-        odometerKm: r.odometer != null ? r.odometer : '',
-        siteName: r.siteName || '',
-        cardNumber: r.cardNumber || '',
-        comments: r.comments || '',
-        externalReference: r.externalReference || '',
-        provider: r.provider || '',
-        licencePlate: r.licencePlate || '',
-        vehicleIdentificationNumber: r.vehicleIdentificationNumber || ''
+        'Date & Time':                   fmtNativeDateTime(r.dateTime),
+        'Vehicle Identification Number': r.vehicleIdentificationNumber || '',
+        'Serial Number':                 r.serialNumber || '',
+        'License Plate':                 r.licencePlate || '',
+        'Vehicle Description':           r.description || '',
+        'Cardholder':                    r.driverName || '',
+        'Card Number':                   r.cardNumber || '',
+        'Volume (L)':                    fmtPlainNumber(r.volume),
+        'Cost':                          fmtPlainNumber(r.cost),
+        'Currency Code':                 r.currencyCode || '',
+        'Product Type':                  r.productType || '',
+        'Transaction Odometer':          fmtPlainNumber(r.odometer),
+        'Location Coordinates':          fmtCoords(r.location),
+        'Location Address':              '',                      // not stored on FuelTransaction entity
+        'Site Name':                     r.siteName || '',
+        'Comments':                      r.comments || ''
       }));
-    const text = window.CSVUtil.serialize(data, CSV_COLUMNS);
+    const text = window.CSVUtil.serialize(data, NATIVE_CSV_COLUMNS);
     const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -614,18 +633,18 @@ geotab.addin.fuelBulkEditor = function () {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
-    setStatus('Exported ' + data.length + ' row(s).', 'success');
+    setStatus('Exported ' + data.length + ' row(s) (native Geotab template).', 'success');
   }
 
   // ── CSV import (bulk-edit upload) ────────────────────────────────────────
-  function onImportFileChosen(file) {
+  function onImportFileChosen(file, mode) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       try {
         const text = String(reader.result || '');
         const parsed = window.CSVUtil.parse(text);
-        applyImport(parsed);
+        applyImport(parsed, mode);
       } catch (err) {
         setStatus('CSV parse failed: ' + (err && err.message ? err.message : err), 'error');
       }
@@ -654,6 +673,7 @@ geotab.addin.fuelBulkEditor = function () {
     'product type':                   'productType',
     'transaction odometer':           'odometer',
     'odometer':                       'odometer',
+    'location coordinates':           'locationCoordinates',
     'location address':               'siteAddress',
     'site name':                      'siteName',
     'comments':                       'comments'
@@ -693,15 +713,15 @@ geotab.addin.fuelBulkEditor = function () {
     return out;
   }
 
-  // Detect format. id-based = round-trip workflow; external = third-party feed.
-  function detectCsvFormat(headers) {
+  // The native Geotab Fuel Transactions Import Template uses VIN/Serial/Plate
+  // as record-identity keys (no `id` column). We mirror that layout exactly,
+  // so all imports flow through the VIN/Serial/Plate matcher.
+  function isNativeTemplate(headers) {
     const lc = headers.map((h) => h.toLowerCase());
-    if (lc.indexOf('id') !== -1) return 'id-based';
-    const hasExternalKey = lc.some((h) => [
+    return [
       'vehicle identification number', 'vin',
       'serial number', 'license plate', 'licence plate'
-    ].indexOf(h) !== -1);
-    return hasExternalKey ? 'external' : 'unknown';
+    ].some((h) => lc.indexOf(h) !== -1);
   }
 
   // Match CSV rows against loaded FuelTransactions by VIN → Serial → Plate,
@@ -766,78 +786,25 @@ geotab.addin.fuelBulkEditor = function () {
     return { matched, unmatched, ambiguous };
   }
 
-  function applyImport(parsed) {
+  function applyImport(parsed, mode) {
     if (!parsed || !parsed.headers || !parsed.headers.length) {
       setStatus('CSV appears empty.', 'error'); return;
     }
-    const format = detectCsvFormat(parsed.headers);
-    if (format === 'unknown') {
-      setStatus('CSV needs either an "id" column (round-trip) or VIN / Serial Number / License Plate columns.', 'error');
+    if (!isNativeTemplate(parsed.headers)) {
+      setStatus('CSV does not match the Geotab Fuel Transactions Import Template. Need at least one of: Vehicle Identification Number, Serial Number, License Plate.', 'error');
       return;
     }
-    if (format === 'external') { return applyExternalImport(parsed); }
-    // Index current rows by id for diffing + version lookup.
-    const byId = new Map();
-    ui.rows.forEach((r) => byId.set(r.id, r));
-
-    const calls = [];
-    const callIdToRowIdx = [];
-    let unknownIds = 0, unchanged = 0;
-    parsed.rows.forEach((row, idx) => {
-      const id = (row.id || '').trim();
-      if (!id) return;
-      const live = byId.get(id);
-      if (!live) { unknownIds++; return; }
-      const patch = {};
-      if (row.dateTime)         patch.dateTime = row.dateTime;
-      if (row.productType)      patch.productType = row.productType;
-      if (row.volumeLiters !== '' && row.volumeLiters != null) patch.volume = row.volumeLiters;
-      if (row.cost !== '' && row.cost != null)                 patch.cost = row.cost;
-      if (row.currencyCode)     patch.currencyCode = row.currencyCode;
-      if (row.odometerKm !== '' && row.odometerKm != null)     patch.odometer = row.odometerKm;
-      if (row.comments != null) patch.comments = row.comments;
-      const clean = sanitizePatch(patch);
-      // Drop fields where new === current to keep call payload lean.
-      for (const k of Object.keys(clean)) {
-        if (live[k] === clean[k]) delete clean[k];
-      }
-      if (!Object.keys(clean).length) { unchanged++; return; }
-      const entity = Object.assign({}, live, clean, { id: live.id, version: live.version });
-      if (entity.driver == null) entity.driver = 'UnknownDriverId';
-      if (typeof entity.device === 'string') entity.device = { id: entity.device };
-      if (entity.sourceData != null && typeof entity.sourceData !== 'string') {
-        try { entity.sourceData = JSON.stringify(entity.sourceData); } catch (_) { entity.sourceData = ''; }
-      }
-      calls.push(['Set', { typeName: 'FuelTransaction', entity }]);
-      callIdToRowIdx.push({ id, idx });
-    });
-
-    if (!calls.length) {
-      setStatus('No changes to apply (' + unknownIds + ' unknown id(s), ' + unchanged + ' unchanged).', 'error');
-      return;
-    }
-    setStatus('Applying ' + calls.length + ' update(s) from CSV…');
-    apiMultiCall(calls).then((results) => {
-      const failures = [];
-      let ok = 0;
-      results.forEach((res, i) => {
-        if (res && res.__error) failures.push({ id: callIdToRowIdx[i].id, err: res.__error });
-        else ok++;
-      });
-      const summary =
-        ok + ' updated, ' +
-        failures.length + ' failed, ' +
-        unknownIds + ' unknown id(s), ' +
-        unchanged + ' unchanged.';
-      showImportSummary(summary, failures);
-      loadTransactions();   // re-Get to refresh version tokens
-    });
+    return applyExternalImport(parsed, mode || 'stage-edits');
   }
 
   // External-format import: match by VIN/Serial/Plate + dateTime, then stage
   // edits against the Geotab-assigned `id` + `version`. Server actions still
   // happen via chunked sequential multiCall.
-  function applyExternalImport(parsed) {
+  // mode:
+  //   'stage-edits' — stage CSV values as pending edits on matched rows (default)
+  //   'match-only'  — just select matched rows; do not touch ui.edited
+  function applyExternalImport(parsed, mode) {
+    mode = mode || 'stage-edits';
     const externals = parsed.rows
       .map((row) => normalizeExternalRow(parsed.headers, row))
       .filter((r) => r.vehicleIdentificationNumber || r.serialNumber || r.licencePlate);
@@ -867,29 +834,28 @@ geotab.addin.fuelBulkEditor = function () {
 
     const finishMatch = () => {
       const result = matchExternalRows(externals, ui.rows);
-      // Stage every matched record as a pending edit (keyed by Geotab id) and
-      // select them so the user can review, then commit via Save edits.
       ui.selected.clear();
       result.matched.forEach(({ csvRow, tx }) => {
-        const patch = sanitizePatch({
-          dateTime:     csvRow.dateTime,
-          productType:  csvRow.productType,
-          volume:       csvRow.volume,
-          cost:         csvRow.cost,
-          currencyCode: csvRow.currencyCode,
-          odometer:     csvRow.odometer,
-          comments:     csvRow.comments
-        });
-        // Drop no-op fields so we don't dirty rows where the value already matches.
-        for (const k of Object.keys(patch)) { if (tx[k] === patch[k]) delete patch[k]; }
-        if (Object.keys(patch).length) {
-          const existing = ui.edited.get(tx.id) || {};
-          ui.edited.set(tx.id, Object.assign({}, existing, patch));
+        if (mode === 'stage-edits') {
+          const patch = sanitizePatch({
+            dateTime:     csvRow.dateTime,
+            productType:  csvRow.productType,
+            volume:       csvRow.volume,
+            cost:         csvRow.cost,
+            currencyCode: csvRow.currencyCode,
+            odometer:     csvRow.odometer,
+            comments:     csvRow.comments
+          });
+          for (const k of Object.keys(patch)) { if (tx[k] === patch[k]) delete patch[k]; }
+          if (Object.keys(patch).length) {
+            const existing = ui.edited.get(tx.id) || {};
+            ui.edited.set(tx.id, Object.assign({}, existing, patch));
+          }
         }
-        ui.selected.add(tx.id);   // makes Delete matched + bulk-edit available
+        ui.selected.add(tx.id);   // both modes select; match-only stops here
       });
       renderTable();
-      showExternalMatchSummary(result);
+      showExternalMatchSummary(result, mode);
     };
 
     if (canUseServerVinSearch) {
@@ -939,8 +905,8 @@ geotab.addin.fuelBulkEditor = function () {
     }
   }
 
-  function showExternalMatchSummary(result) {
-    $('ftbe-modal-title').textContent = 'CSV match summary';
+  function showExternalMatchSummary(result, mode) {
+    $('ftbe-modal-title').textContent = (mode === 'match-only') ? 'CSV lookup summary' : 'CSV match summary';
     const body = $('ftbe-modal-body');
     const reasonsHtml = result.matched.slice(0, 25).map((m) =>
       '<li><code>' + escapeHtml(m.tx.id) + '</code> ← ' +
@@ -961,31 +927,15 @@ geotab.addin.fuelBulkEditor = function () {
       '<p class="addin-import-summary"><b>' + result.matched.length + '</b> matched, ' +
         '<b>' + result.unmatched.length + '</b> unmatched, ' +
         '<b>' + result.ambiguous.length + '</b> ambiguous.</p>' +
-      '<p>Matched rows are now selected and staged with edits. Click <b>Save edits</b> ' +
-        'to commit via the Geotab-assigned <code>id</code> + <code>version</code>, or ' +
-        '<b>Delete selected</b> to remove them.</p>' +
+      (mode === 'match-only'
+        ? '<p>Matched rows are selected. <b>No edits were staged and nothing was sent to Geotab.</b> ' +
+          'Use the row Edit buttons, <b>Bulk edit selected</b>, or <b>Delete selected</b> to act on them.</p>'
+        : '<p>Matched rows are now selected and staged with edits from the CSV. Click <b>Save edits</b> ' +
+          'to commit via the Geotab-assigned <code>id</code> + <code>version</code>, or ' +
+          '<b>Delete selected</b> to remove them.</p>') +
       (reasonsHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Matches</h3><ul class="addin-import-summary">' + reasonsHtml + '</ul>' : '') +
       (unmatchedHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Unmatched</h3><ul class="addin-import-summary">' + unmatchedHtml + '</ul>' : '') +
       (ambHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Ambiguous</h3><ul class="addin-import-summary">' + ambHtml + '</ul>' : '');
-    showModal(null, true);
-  }
-
-  function showImportSummary(summary, failures) {
-    $('ftbe-modal-title').textContent = 'CSV import summary';
-    const body = $('ftbe-modal-body');
-    let html = '<p class="addin-import-summary">' + escapeHtml(summary) + '</p>';
-    if (failures && failures.length) {
-      html += '<ul class="addin-import-summary">' +
-        failures.slice(0, 25).map((f) =>
-          '<li class="addin-import-error">' +
-            '<code>' + escapeHtml(f.id) + '</code>: ' +
-            escapeHtml(f.err && (f.err.message || f.err.name) || String(f.err)) +
-          '</li>'
-        ).join('') +
-        (failures.length > 25 ? '<li>… and ' + (failures.length - 25) + ' more</li>' : '') +
-      '</ul>';
-    }
-    body.innerHTML = html;
     showModal(null, true);
   }
 
@@ -1043,7 +993,13 @@ geotab.addin.fuelBulkEditor = function () {
     $('ftbe-import-csv').addEventListener('click', () => $('ftbe-file').click());
     $('ftbe-file').addEventListener('change', (e) => {
       const f = e.target.files && e.target.files[0];
-      onImportFileChosen(f);
+      onImportFileChosen(f, 'stage-edits');
+      e.target.value = '';
+    });
+    $('ftbe-match-csv').addEventListener('click', () => $('ftbe-file-match').click());
+    $('ftbe-file-match').addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      onImportFileChosen(f, 'match-only');
       e.target.value = '';
     });
     $('ftbe-search').addEventListener('input', () => renderTable());

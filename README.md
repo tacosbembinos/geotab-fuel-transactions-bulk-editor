@@ -33,15 +33,29 @@ Open `fuelBulkEditor.html` directly in a browser. The standalone bootstrap shim
 at the bottom of `scripts/main.js` runs `initialize` with a stub `api` — UI
 controls render, but Geotab API calls reject with `API unavailable`.
 
-## CSV import formats
+## CSV import / export — native Geotab template
 
-**Round-trip (`id`-based).** Export from this add-in; edit values in your editor
-of choice; re-import. The script matches by `id` and re-sends with the original
-`version` for optimistic-concurrency.
+Both export and import use the **native Geotab "Fuel Transactions Import
+Template"** layout — identical 16 column headers in the same order. This is
+the same file shape Geotab's built-in importer reads, and the same shape most
+fuel-card providers (e.g. WEX, Comdata, Fuelman) emit:
 
-**External (third-party fuel-card feed).** No `id` column required. Provide any
-of `Vehicle Identification Number` / `Serial Number` / `License Plate`. The
-script prefers a server-side `vehicleIdentificationNumber` search (HAR-verified
-the Drive App uses this filter) when the CSV has ≤100 unique VINs; otherwise it
-falls back to a date-window pull. Matches are narrowed by ±5 min `dateTime`
-tolerance, then staged as pending edits keyed by the Geotab-assigned `id`.
+```
+Date & Time, Vehicle Identification Number, Serial Number, License Plate,
+Vehicle Description, Cardholder, Card Number, Volume (L), Cost, Currency Code,
+Product Type, Transaction Odometer, Location Coordinates, Location Address,
+Site Name, Comments
+```
+
+Record identity is by **VIN → Serial Number → License Plate** (in that
+precedence), narrowed by `±5 min` `Date & Time` tolerance. Matched rows are
+staged as pending edits keyed by the Geotab-assigned `id` + `version`; the
+user reviews, then commits via **Save edits** (chunked sequential `multiCall`
+`Set`) or removes via **Delete selected** (`multiCall` `Remove`). Unmatched
+rows are reported in a summary modal and not silently turned into `Add`
+operations.
+
+When the CSV has ≤100 unique VINs, the script issues per-VIN
+`vehicleIdentificationNumber` searches (HAR-verified that the Drive App uses
+this server-side filter); otherwise it falls back to a single date-window pull
+covering min/max `Date & Time` ±1 day.
