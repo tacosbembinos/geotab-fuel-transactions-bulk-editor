@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self';
-                 script-src 'self';
-                 style-src 'self' 'unsafe-inline';
+        content="default-src 'self' https://cdn.jsdelivr.net;
+                 script-src 'self' https://cdn.jsdelivr.net;
+                 style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;
                  img-src 'self' data: blob: https:;
                  connect-src 'self' https:;
                  font-src 'self' data:;
@@ -18,7 +18,11 @@
   <meta name="referrer" content="strict-origin-when-cross-origin">
 
   <title>Fuel Transactions Bulk Editor</title>
-  <link rel="stylesheet" href="styles/main.css">
+  <!-- Assets pinned to jsDelivr so they resolve correctly in both iframe mode
+       (document origin = jsDelivr) and inline-into-<main> mode (document
+       origin = my.geotab.com). Bump the @main tag to a release tag when
+       cutting versions so customers aren't pinned to a moving HEAD. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/styles/main.css">
 </head>
 <body>
 
@@ -118,8 +122,8 @@
   </div>
 </div>
 
-<script src="scripts/csv.js"></script>
-<script src="scripts/main.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/csv.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/main.js"></script>
 
 </body>
 </html>
