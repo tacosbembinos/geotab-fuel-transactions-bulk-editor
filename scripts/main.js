@@ -794,7 +794,138 @@ geotab.addin.fuelBulkEditor = function () {
       setStatus('CSV does not match the Geotab Fuel Transactions Import Template. Need at least one of: Vehicle Identification Number, Serial Number, License Plate.', 'error');
       return;
     }
+    if (mode === 'force-add') return applyForceImport(parsed);
     return applyExternalImport(parsed, mode || 'stage-edits');
+  }
+
+  // Force Import — Add every CSV row as a NEW FuelTransaction. Bypasses the
+  // VIN/Serial/Plate matcher.
+  //
+  // Entity fields populated here are limited to what the Geotab FuelTransaction
+  // entity actually documents (geotab.com/sdk → FuelTransaction). We do NOT
+  // mirror Drive-specific quirks observed in HAR captures — e.g. synthesising
+  // `description: "eds_account-<serial>"` (a Drive internal device marker, not
+  // a vehicle description) or stamping `sourceData` with a stringified clone
+  // of the entity itself (sourceData per the spec is the raw upstream payload
+  // from a fuel-card provider, not a self-referential blob). Both would inject
+  // garbage into the audit trail. Only set a field if the CSV supplies a real
+  // value for it.
+  function buildAddEntity(csvRow) {
+    const entity = {};
+    if (csvRow.dateTime) {
+      const d = new Date(csvRow.dateTime);
+      if (!isNaN(d)) entity.dateTime = d.toISOString();
+    }
+    const vin    = csvRow.vehicleIdentificationNumber ? String(csvRow.vehicleIdentificationNumber).trim() : '';
+    const serial = csvRow.serialNumber ? String(csvRow.serialNumber).trim() : '';
+    const plate  = csvRow.licencePlate ? String(csvRow.licencePlate).trim() : '';
+    if (vin)    entity.vehicleIdentificationNumber = vin;
+    if (serial) entity.serialNumber = serial;
+    if (plate)  entity.licencePlate = plate;
+
+    if (csvRow.description) entity.description = String(csvRow.description);
+    if (csvRow.driverName)  entity.driverName  = String(csvRow.driverName);
+    if (csvRow.cardNumber)  entity.cardNumber  = String(csvRow.cardNumber);
+
+    const volNum  = Number(stripCommas(csvRow.volume));
+    const costNum = Number(stripCommas(csvRow.cost));
+    const odoNum  = Number(stripCommas(csvRow.odometer));
+    if (isFinite(volNum)  && volNum  >= 0) entity.volume   = volNum;
+    if (isFinite(costNum) && costNum >= 0) entity.cost     = costNum;
+    if (isFinite(odoNum)  && odoNum  >= 0) entity.odometer = odoNum;
+
+    if (csvRow.currencyCode && /^[A-Z]{3}$/.test(String(csvRow.currencyCode).trim())) {
+      entity.currencyCode = String(csvRow.currencyCode).trim();
+    }
+    if (csvRow.productType) {
+      const syn = PRODUCT_TYPE_SYNONYMS[String(csvRow.productType).toLowerCase()];
+      const pt  = syn || csvRow.productType;
+      if (PRODUCT_TYPES.indexOf(pt) !== -1) entity.productType = pt;
+    }
+
+    if (csvRow.locationCoordinates) {
+      const parts = String(csvRow.locationCoordinates).split(',').map((s) => Number(String(s).trim()));
+      if (parts.length === 2 && isFinite(parts[0]) && isFinite(parts[1])) {
+        entity.location = { y: parts[0], x: parts[1] };   // y=lat, x=lon
+      }
+    }
+    if (csvRow.siteName) entity.siteName = String(csvRow.siteName);
+    if (csvRow.comments) entity.comments = String(csvRow.comments).slice(0, 1024);
+
+    // `provider` is a free-form attribution string. Stamp our add-in so the
+    // audit trail correctly identifies the source.
+    entity.provider = 'FuelTransactionsBulkEditor';
+    return entity;
+  }
+
+  function applyForceImport(parsed) {
+    const externals = parsed.rows
+      .map((row) => normalizeExternalRow(parsed.headers, row))
+      .filter((r) => r.vehicleIdentificationNumber || r.serialNumber || r.licencePlate);
+    if (!externals.length) {
+      setStatus('No usable rows (need VIN, Serial, or Plate on every row).', 'error');
+      return;
+    }
+    const rejected = [];
+    const adds = [];
+    externals.forEach((csvRow, idx) => {
+      const entity = buildAddEntity(csvRow);
+      if (!entity.dateTime) { rejected.push({ idx, reason: 'missing or unparseable Date & Time' }); return; }
+      if (!entity.vehicleIdentificationNumber && !entity.serialNumber && !entity.licencePlate) {
+        rejected.push({ idx, reason: 'missing VIN / Serial / Plate' }); return;
+      }
+      adds.push({ csvRow, entity });
+    });
+    if (!adds.length) {
+      setStatus('Force Import: every row was rejected (need Date & Time + VIN/Serial/Plate).', 'error');
+      return;
+    }
+    const msg = 'Force Import will ADD ' + adds.length + ' NEW FuelTransaction(s) to your database.\n\n' +
+                (rejected.length ? rejected.length + ' row(s) will be skipped (missing required fields).\n\n' : '') +
+                'This bypasses the VIN/Serial/Plate matcher and cannot be undone except by Delete. Continue?';
+    if (!confirm(msg)) { setStatus('Force Import cancelled.'); return; }
+
+    const calls = adds.map(({ entity }) => ['Add', { typeName: 'FuelTransaction', entity }]);
+    setStatus('Force-adding ' + calls.length + ' transaction(s)…');
+    apiMultiCall(calls).then((results) => {
+      const failures = [];
+      let ok = 0;
+      results.forEach((res, idx) => {
+        if (res && res.__error) failures.push({ csvRow: adds[idx].csvRow, err: res.__error });
+        else ok++;
+      });
+      const fail = failures.length;
+      if (fail) {
+        setStatus(ok + ' added, ' + fail + ' failed. Reloading…', 'error');
+        console.warn('[fuelBulkEditor] force-import failures', failures);
+      } else {
+        setStatus(ok + ' transaction(s) added.', 'success');
+      }
+      showForceImportSummary({ added: ok, failed: fail, skipped: rejected.length, failures });
+      loadTransactions();
+    }).catch((err) => {
+      setStatus('Force Import failed: ' + (err && err.message ? err.message : err), 'error');
+    });
+  }
+
+  function showForceImportSummary(s) {
+    $('ftbe-modal-title').textContent = 'Force Import summary';
+    const body = $('ftbe-modal-body');
+    const failHtml = s.failures.slice(0, 25).map((f) => {
+      const id = f.csvRow.vehicleIdentificationNumber || f.csvRow.serialNumber || f.csvRow.licencePlate || '(no key)';
+      const msg = (f.err && f.err.message) ? f.err.message : String(f.err || 'unknown');
+      return '<li class="addin-import-error">' + escapeHtml(id) + ' — ' + escapeHtml(msg) + '</li>';
+    }).join('');
+    body.innerHTML =
+      '<p class="addin-import-summary">' +
+        '<b>' + s.added + '</b> added, ' +
+        '<b>' + s.failed + '</b> failed, ' +
+        '<b>' + s.skipped + '</b> skipped (missing required fields).</p>' +
+      (failHtml
+        ? '<h3 style="font-size:13px;margin:10px 0 4px">Failures (server-rejected)</h3>' +
+          '<ul class="addin-import-summary">' + failHtml + '</ul>'
+        : '');
+    showModal(null, true);
   }
 
   // External-format import: match by VIN/Serial/Plate + dateTime, then stage
@@ -1000,6 +1131,12 @@ geotab.addin.fuelBulkEditor = function () {
     $('ftbe-file-match').addEventListener('change', (e) => {
       const f = e.target.files && e.target.files[0];
       onImportFileChosen(f, 'match-only');
+      e.target.value = '';
+    });
+    $('ftbe-force-import').addEventListener('click', () => $('ftbe-file-force').click());
+    $('ftbe-file-force').addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      onImportFileChosen(f, 'force-add');
       e.target.value = '';
     });
     $('ftbe-search').addEventListener('input', () => renderTable());
