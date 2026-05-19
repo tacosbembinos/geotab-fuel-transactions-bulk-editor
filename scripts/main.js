@@ -50,6 +50,7 @@ geotab.addin.fuelBulkEditor = function () {
   const ui = {
     initialized: false,
     inflight: new Set(),       // AbortController-like { abort() } shims
+    opGen: 0,                  // bumped on every blur/unload — callers capture it and bail on stale
     rows: [],                  // current loaded FuelTransactions (canonical/raw shape)
     edited: new Map(),         // id -> patch object (pending UI edits)
     selected: new Set(),       // selected row ids
@@ -61,6 +62,21 @@ geotab.addin.fuelBulkEditor = function () {
     odoUnit: 'km',
     lastFocusEl: null          // for modal focus restoration
   };
+
+  // Cancellation contract:
+  //   - blur()/unload() bump ui.opGen and abort every handle in ui.inflight.
+  //   - apiCall rejects its Promise with CANCELLED so chained .then()s don't
+  //     orphan and status updates can run their .catch path.
+  //   - apiMultiCall short-circuits between chunks: any chunks not yet issued
+  //     are padded with { __cancelled: true } so callers can count partials.
+  //   - Top-level handlers capture `const myGen = ui.opGen` at entry and
+  //     short-circuit if it no longer matches before touching shared state.
+  //     That prevents stale loads from clobbering a fresher one and stops
+  //     post-completion side effects (e.g. auto-reload after Save) from
+  //     firing on an add-in the user has navigated away from.
+  const CANCELLED = Object.freeze({ __cancelled: true });
+  function isCancelled(e) { return !!(e && e.__cancelled); }
+  function isStale(gen) { return gen !== ui.opGen; }
 
   // ── DOM helpers ──────────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
@@ -80,6 +96,8 @@ geotab.addin.fuelBulkEditor = function () {
 
   // ── API plumbing ─────────────────────────────────────────────────────────
   // Wraps api.call in a Promise + tracks a cancel handle in ui.inflight.
+  // On cancel the Promise REJECTS with CANCELLED — never silently swallows the
+  // callback, which would orphan the Promise and leave the UI status stuck.
   function apiCall(method, params) {
     if (!api || typeof api.call !== 'function') {
       return Promise.reject(new Error('API unavailable (standalone preview)'));
@@ -90,15 +108,29 @@ geotab.addin.fuelBulkEditor = function () {
     return new Promise((resolve, reject) => {
       try {
         api.call(method, params,
-          (res) => { ui.inflight.delete(handle); if (!cancelled) resolve(res); },
-          (err) => { ui.inflight.delete(handle); if (!cancelled) reject(err); });
+          (res) => {
+            ui.inflight.delete(handle);
+            if (cancelled) reject(CANCELLED); else resolve(res);
+          },
+          (err) => {
+            ui.inflight.delete(handle);
+            if (cancelled) reject(CANCELLED); else reject(err);
+          });
       } catch (e) { ui.inflight.delete(handle); reject(e); }
     });
   }
 
   // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK — BUILD_GUIDE §6 / §7.6.
-  // Validates each sub-call argument; the server aborts a whole batch on one bad shape.
-  function apiMultiCall(calls) {
+  // - Validates each sub-call (server aborts a whole batch on one bad shape).
+  // - Real cancellation: between chunks, if the handle was aborted, remaining
+  //   sub-calls are padded with { __cancelled: true } and resolve immediately.
+  //   We can't recall chunks already in flight on the server, but we stop
+  //   issuing new ones — which is what matters for blur during a bulk Save.
+  // - Progress: when chunks > 1, setStatus reports "N / total" after each
+  //   chunk so long imports/saves don't look hung.
+  // opts: { label?: string, gen?: number }
+  function apiMultiCall(calls, opts) {
+    opts = opts || {};
     if (!api || typeof api.multiCall !== 'function') {
       return Promise.reject(new Error('multiCall unavailable'));
     }
@@ -110,14 +142,37 @@ geotab.addin.fuelBulkEditor = function () {
     for (let i = 0; i < valid.length; i += MULTICALL_CHUNK) {
       chunks.push(valid.slice(i, i + MULTICALL_CHUNK));
     }
-    return chunks.reduce((p, chunk) => p.then((acc) => new Promise((resolve) => {
-      const handle = { abort() {} };
-      ui.inflight.add(handle);
+    let cancelled = false;
+    const handle = { abort() { cancelled = true; } };
+    ui.inflight.add(handle);
+    const total = valid.length;
+    const label = opts.label || null;
+    let done = 0;
+
+    return chunks.reduce((p, chunk, idx) => p.then((acc) => new Promise((resolve) => {
+      // Caller-driven cancellation (focus moved, user cancelled, unload).
+      if (cancelled || (opts.gen != null && isStale(opts.gen))) {
+        const rest = chunks.slice(idx).reduce((n, c) => n + c.length, 0);
+        resolve(acc.concat(new Array(rest).fill({ __cancelled: true })));
+        return;
+      }
       api.multiCall(chunk,
-        (results) => { ui.inflight.delete(handle); resolve(acc.concat(results || [])); },
-        (err)     => { ui.inflight.delete(handle); resolve(acc.concat(chunk.map(() => ({ __error: err })))); }
-      );
-    })), Promise.resolve([]));
+        (results) => {
+          done += chunk.length;
+          if (label && chunks.length > 1 && !isStale(opts.gen != null ? opts.gen : ui.opGen)) {
+            setStatus(label + ' — ' + done + ' / ' + total +
+                      ' (chunk ' + (idx + 1) + ' of ' + chunks.length + ')…');
+          }
+          resolve(acc.concat(results || []));
+        },
+        (err) => {
+          done += chunk.length;
+          resolve(acc.concat(chunk.map(() => ({ __error: err }))));
+        });
+    })), Promise.resolve([])).then((results) => {
+      ui.inflight.delete(handle);
+      return results;
+    });
   }
 
   // ── Unit + format helpers ────────────────────────────────────────────────
@@ -149,18 +204,25 @@ geotab.addin.fuelBulkEditor = function () {
       ['Get', { typeName: 'Device', resultsLimit: 10000 }],
       ['Get', { typeName: 'Driver', resultsLimit: 10000 }]
     ];
-    return apiMultiCall(calls).then((results) => {
+    const myGen = ui.opGen;
+    return apiMultiCall(calls, { gen: myGen }).then((results) => {
+      if (isStale(myGen)) return;
       const devices = (results && results[0]) || [];
       const drivers = (results && results[1]) || [];
+      // Skip cancellation placeholders.
+      if (devices && devices.__cancelled) return;
       ui.deviceById.clear();
       ui.driverById.clear();
-      devices.forEach((d) => { if (d && d.id) ui.deviceById.set(d.id, d.name || d.id); });
-      drivers.forEach((d) => {
+      (Array.isArray(devices) ? devices : []).forEach((d) => {
+        if (d && d.id) ui.deviceById.set(d.id, d.name || d.id);
+      });
+      (Array.isArray(drivers) ? drivers : []).forEach((d) => {
         if (d && d.id) ui.driverById.set(d.id, [d.firstName, d.lastName].filter(Boolean).join(' ') || d.name || d.id);
       });
       populateSelect($('ftbe-device'), ui.deviceById, 'All devices');
       populateSelect($('ftbe-driver'), ui.driverById, 'All drivers');
     }).catch((err) => {
+      if (isCancelled(err)) return;            // expected on blur/unload — not a failure
       console.warn('[fuelBulkEditor] reference data load failed', err);
     });
   }
@@ -197,13 +259,16 @@ geotab.addin.fuelBulkEditor = function () {
     ui.selected.clear();
     renderTable();
 
+    const myGen = ui.opGen;
     apiCall('Get', { typeName: 'FuelTransaction', search, resultsLimit: RESULTS_LIMIT })
       .then((rows) => {
+        if (isStale(myGen)) return;          // user moved on; drop result
         ui.rows = Array.isArray(rows) ? rows : [];
         applySortAndRender();
         setStatus(ui.rows.length + ' transactions loaded.', 'success');
       })
       .catch((err) => {
+        if (isStale(myGen) || isCancelled(err)) return;
         setStatus('Load failed: ' + (err && err.message ? err.message : err), 'error');
       });
   }
@@ -521,22 +586,29 @@ geotab.addin.fuelBulkEditor = function () {
     }
     if (!calls.length) return;
     setStatus('Saving ' + calls.length + ' edit(s)…');
-    apiMultiCall(calls).then((results) => {
-      let ok = 0, fail = 0;
+    const myGen = ui.opGen;
+    apiMultiCall(calls, { label: 'Saving edits', gen: myGen }).then((results) => {
+      if (isStale(myGen)) return;
+      let ok = 0, fail = 0, cancelled = 0;
       const failures = [];
       results.forEach((res, idx) => {
-        if (res && res.__error) { fail++; failures.push({ id: callIdToTxId[idx], err: res.__error }); }
+        if (res && res.__cancelled) { cancelled++; }
+        else if (res && res.__error) { fail++; failures.push({ id: callIdToTxId[idx], err: res.__error }); }
         else { ok++; ui.edited.delete(callIdToTxId[idx]); }
       });
-      if (fail) {
+      if (cancelled) {
+        setStatus(ok + ' saved, ' + cancelled + ' not sent (cancelled).', 'error');
+      } else if (fail) {
         setStatus(ok + ' saved, ' + fail + ' failed. Reloading to refresh versions…', 'error');
         console.warn('[fuelBulkEditor] save failures', failures);
       } else {
         setStatus(ok + ' edit(s) saved.', 'success');
       }
       // Re-Get so stale `version` tokens refresh (optimistic-concurrency hygiene).
-      loadTransactions();
+      // Gate on gen — if blur happened during save, don't kick off a fresh load.
+      if (!isStale(myGen)) loadTransactions();
     }).catch((err) => {
+      if (isStale(myGen) || isCancelled(err)) return;
       setStatus('Save failed: ' + (err && err.message ? err.message : err), 'error');
     });
   }
@@ -547,13 +619,22 @@ geotab.addin.fuelBulkEditor = function () {
     if (!confirm('Delete ' + ids.length + ' transaction(s)? This cannot be undone.')) return;
     const calls = ids.map((id) => ['Remove', { typeName: 'FuelTransaction', entity: { id } }]);
     setStatus('Deleting ' + calls.length + '…');
-    apiMultiCall(calls).then((results) => {
+    const myGen = ui.opGen;
+    apiMultiCall(calls, { label: 'Deleting', gen: myGen }).then((results) => {
+      if (isStale(myGen)) return;
+      const cancelled = results.filter((r) => r && r.__cancelled).length;
       const fail = results.filter((r) => r && r.__error).length;
-      const ok = results.length - fail;
+      const ok = results.length - fail - cancelled;
       ui.selected.clear();
       ids.forEach((id) => ui.edited.delete(id));
-      setStatus(ok + ' deleted' + (fail ? (', ' + fail + ' failed') : ''), fail ? 'error' : 'success');
-      loadTransactions();
+      const msg = ok + ' deleted' +
+        (fail ? (', ' + fail + ' failed') : '') +
+        (cancelled ? (', ' + cancelled + ' not sent (cancelled)') : '');
+      setStatus(msg, (fail || cancelled) ? 'error' : 'success');
+      if (!isStale(myGen)) loadTransactions();
+    }).catch((err) => {
+      if (isStale(myGen) || isCancelled(err)) return;
+      setStatus('Delete failed: ' + (err && err.message ? err.message : err), 'error');
     });
   }
 
@@ -887,23 +968,29 @@ geotab.addin.fuelBulkEditor = function () {
 
     const calls = adds.map(({ entity }) => ['Add', { typeName: 'FuelTransaction', entity }]);
     setStatus('Force-adding ' + calls.length + ' transaction(s)…');
-    apiMultiCall(calls).then((results) => {
+    const myGen = ui.opGen;
+    apiMultiCall(calls, { label: 'Force-adding', gen: myGen }).then((results) => {
+      if (isStale(myGen)) return;
       const failures = [];
-      let ok = 0;
+      let ok = 0, cancelled = 0;
       results.forEach((res, idx) => {
-        if (res && res.__error) failures.push({ csvRow: adds[idx].csvRow, err: res.__error });
+        if (res && res.__cancelled) cancelled++;
+        else if (res && res.__error) failures.push({ csvRow: adds[idx].csvRow, err: res.__error });
         else ok++;
       });
       const fail = failures.length;
-      if (fail) {
+      if (cancelled) {
+        setStatus(ok + ' added, ' + cancelled + ' not sent (cancelled), ' + fail + ' failed.', 'error');
+      } else if (fail) {
         setStatus(ok + ' added, ' + fail + ' failed. Reloading…', 'error');
         console.warn('[fuelBulkEditor] force-import failures', failures);
       } else {
         setStatus(ok + ' transaction(s) added.', 'success');
       }
-      showForceImportSummary({ added: ok, failed: fail, skipped: rejected.length, failures });
-      loadTransactions();
+      showForceImportSummary({ added: ok, failed: fail, skipped: rejected.length, cancelled, failures });
+      if (!isStale(myGen)) loadTransactions();
     }).catch((err) => {
+      if (isStale(myGen) || isCancelled(err)) return;
       setStatus('Force Import failed: ' + (err && err.message ? err.message : err), 'error');
     });
   }
@@ -920,7 +1007,9 @@ geotab.addin.fuelBulkEditor = function () {
       '<p class="addin-import-summary">' +
         '<b>' + s.added + '</b> added, ' +
         '<b>' + s.failed + '</b> failed, ' +
-        '<b>' + s.skipped + '</b> skipped (missing required fields).</p>' +
+        '<b>' + s.skipped + '</b> skipped (missing required fields)' +
+        (s.cancelled ? ', <b>' + s.cancelled + '</b> not sent (cancelled)' : '') +
+        '.</p>' +
       (failHtml
         ? '<h3 style="font-size:13px;margin:10px 0 4px">Failures (server-rejected)</h3>' +
           '<ul class="addin-import-summary">' + failHtml + '</ul>'
@@ -989,6 +1078,8 @@ geotab.addin.fuelBulkEditor = function () {
       showExternalMatchSummary(result, mode);
     };
 
+    const myGen = ui.opGen;
+
     if (canUseServerVinSearch) {
       setStatus('Fetching FuelTransactions by VIN (' + uniqueVins.length + ')…');
       const calls = uniqueVins.map((vin) => ['Get', {
@@ -996,11 +1087,16 @@ geotab.addin.fuelBulkEditor = function () {
         search: { fromDate: fromIso, toDate: toIso, vehicleIdentificationNumber: vin },
         resultsLimit: 10000
       }]);
-      apiMultiCall(calls).then((results) => {
+      apiMultiCall(calls, { label: 'Fetching by VIN', gen: myGen }).then((results) => {
+        if (isStale(myGen)) return;
+        const cancelled = results.filter((r) => r && r.__cancelled).length;
+        if (cancelled === results.length) {
+          setStatus('CSV match cancelled before any data returned.'); return;
+        }
         const merged = [];
         const seen = new Set();
         results.forEach((bucket) => {
-          if (bucket && bucket.__error) return;
+          if (!bucket || bucket.__error || bucket.__cancelled) return;
           (bucket || []).forEach((tx) => {
             if (tx && tx.id && !seen.has(tx.id)) { seen.add(tx.id); merged.push(tx); }
           });
@@ -1008,8 +1104,10 @@ geotab.addin.fuelBulkEditor = function () {
         ui.rows = merged;
         if (fromIso) $('ftbe-from').value = isoToLocalInput(fromIso);
         if (toIso)   $('ftbe-to').value   = isoToLocalInput(toIso);
+        if (cancelled) setStatus(cancelled + ' VIN bucket(s) were not fetched (cancelled). Match may be partial.', 'error');
         finishMatch();
       }).catch((err) => {
+        if (isStale(myGen) || isCancelled(err)) return;
         setStatus('Per-VIN fetch failed: ' + (err && err.message ? err.message : err), 'error');
       });
     } else if (needFetch) {
@@ -1019,11 +1117,13 @@ geotab.addin.fuelBulkEditor = function () {
         search: { fromDate: fromIso, toDate: toIso },
         resultsLimit: RESULTS_LIMIT
       }).then((rows) => {
+        if (isStale(myGen)) return;
         ui.rows = Array.isArray(rows) ? rows : [];
         if (fromIso) $('ftbe-from').value = isoToLocalInput(fromIso);
         if (toIso)   $('ftbe-to').value   = isoToLocalInput(toIso);
         finishMatch();
       }).catch((err) => {
+        if (isStale(myGen) || isCancelled(err)) return;
         setStatus('Fetch failed: ' + (err && err.message ? err.message : err), 'error');
       });
     } else {
@@ -1217,9 +1317,23 @@ geotab.addin.fuelBulkEditor = function () {
       // Sticky-header table is the only size-aware element; re-render in
       // case the iframe was display:none during blur.
       requestAnimationFrame(() => renderTable());
+      // If a prior operation was cancelled by blur, the status line may still
+      // read "Loading transactions…" or "Saving N edits…". Reset it to a
+      // truthful state so the user isn't misled into thinking work is still
+      // in flight after they return.
+      const statusEl = $('ftbe-status');
+      if (statusEl && /…$/.test(statusEl.textContent || '')) {
+        setStatus('Resumed. Previous operation was cancelled when the tab lost focus — re-run if needed.');
+      }
     },
 
     blur: function () {
+      // Bump the generation token FIRST so any callback that lands after this
+      // line sees a stale gen and short-circuits. Then abort each handle so
+      // apiCall rejects with CANCELLED and apiMultiCall stops issuing further
+      // chunks. We cannot recall a chunk already in flight on the server —
+      // its writes will still land — but no NEW chunks will be sent.
+      ui.opGen++;
       ui.inflight.forEach((c) => { try { c.abort(); } catch (_) {} });
       ui.inflight.clear();
     },
