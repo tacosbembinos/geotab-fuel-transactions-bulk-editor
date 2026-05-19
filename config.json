@@ -1,0 +1,16 @@
+{
+  "name": "Fuel Transactions Bulk Editor",
+  "supportEmail": "abembridge@advtracking.net",
+  "version": "1.0.0",
+  "items": [
+    {
+      "url": "fuelBulkEditor.html",
+      "path": "EngineMaintenanceLink/",
+      "menuName": { "en": "Fuel Transactions Bulk Editor" },
+      "icon": "images/icon.svg",
+      "menuHeader": false,
+      "securityIds": []
+    }
+  ],
+  "isSigned": false
+}

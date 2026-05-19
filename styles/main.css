@@ -1,0 +1,124 @@
+.addin-root {
+  --geo-blue: #0071CE;     --geo-blue-dk: #005BA6;     --geo-blue-lt: #E6F2FB;
+  --geo-grey-100: #F4F5F6; --geo-grey-200: #E2E4E7;    --geo-grey-300: #CBD0D6;
+  --geo-grey-400: #A0A7B0; --geo-grey-600: #5C6470;    --geo-grey-900: #1A2029;
+  --geo-green: #2E7D32;    --geo-amber: #E65100;       --geo-red: #C62828;
+  --radius-sm: 4px; --radius-md: 6px; --radius-lg: 8px;
+  --shadow-card: 0 1px 3px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.06);
+
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--geo-grey-900);
+  background: var(--geo-grey-100);
+  padding: 12px;
+  min-height: 100%;
+}
+
+.addin-root *, .addin-root *::before, .addin-root *::after { box-sizing: border-box; }
+
+.addin-header { margin-bottom: 12px; }
+.addin-header__title { font-size: 20px; font-weight: 600; }
+.addin-header__subtitle { color: var(--geo-grey-600); margin-top: 2px; }
+
+.card {
+  background: #fff; border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card); padding: 12px 14px; margin-bottom: 12px;
+}
+
+.addin-toolbar__row {
+  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 12px;
+}
+.addin-toolbar__row--secondary { margin-top: 10px; align-items: center; }
+.addin-spacer { flex: 1; }
+
+.addin-field { display: flex; flex-direction: column; gap: 4px; min-width: 140px; }
+.addin-field--inline { min-width: 130px; }
+.addin-field span { font-size: 12px; color: var(--geo-grey-600); font-weight: 500; }
+.addin-field input, .addin-field select, .addin-field textarea {
+  font: inherit; padding: 6px 8px;
+  border: 1px solid var(--geo-grey-300); border-radius: var(--radius-sm);
+  background: #fff; color: var(--geo-grey-900);
+}
+.addin-field input:focus, .addin-field select:focus, .addin-field textarea:focus {
+  outline: 2px solid var(--geo-blue-lt); border-color: var(--geo-blue);
+}
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px;
+  border: 1px solid var(--geo-grey-300); border-radius: var(--radius-sm);
+  background: #fff; color: var(--geo-grey-900); cursor: pointer; font: inherit;
+}
+.btn:hover { background: var(--geo-grey-100); }
+.btn--primary { background: var(--geo-blue); border-color: var(--geo-blue); color: #fff; }
+.btn--primary:hover { background: var(--geo-blue-dk); border-color: var(--geo-blue-dk); }
+.btn--danger { background: #fff; border-color: var(--geo-red); color: var(--geo-red); }
+.btn--danger:hover { background: var(--geo-red); color: #fff; }
+.btn:disabled, .is-rbac-blocked { opacity: .5; cursor: not-allowed; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; clip: rect(0 0 0 0); overflow: hidden; }
+
+.addin-status { color: var(--geo-grey-600); font-variant-numeric: tabular-nums; }
+.addin-status.is-error { color: var(--geo-red); font-weight: 500; }
+.addin-status.is-success { color: var(--geo-green); font-weight: 500; }
+
+.addin-table-wrap { padding: 0; overflow: auto; max-height: calc(100vh - 280px); }
+.addin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.addin-table thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--geo-grey-100);
+  text-align: left; padding: 8px 10px; font-weight: 600;
+  border-bottom: 1px solid var(--geo-grey-200); white-space: nowrap;
+  cursor: pointer; user-select: none;
+}
+.addin-table thead th[data-sort]::after { content: ' ⇅'; color: var(--geo-grey-400); font-size: 11px; }
+.addin-table thead th.is-sort-asc::after  { content: ' ↑'; color: var(--geo-blue); }
+.addin-table thead th.is-sort-desc::after { content: ' ↓'; color: var(--geo-blue); }
+.addin-table tbody td {
+  padding: 6px 10px; border-bottom: 1px solid var(--geo-grey-200);
+  vertical-align: middle; white-space: nowrap;
+}
+.addin-table tbody tr:hover { background: var(--geo-blue-lt); }
+.addin-table tbody tr.is-selected { background: #FFF7E0; }
+.addin-table tbody tr.is-edited td { background: #FFFBE6; }
+.addin-col-num { text-align: right; font-variant-numeric: tabular-nums; }
+.addin-col-check, .addin-col-actions { width: 1%; }
+.addin-empty { text-align: center; padding: 24px; color: var(--geo-grey-600); }
+.addin-row-btn {
+  background: none; border: none; color: var(--geo-blue); cursor: pointer;
+  font: inherit; padding: 2px 6px;
+}
+.addin-row-btn:hover { text-decoration: underline; }
+.addin-row-btn--danger { color: var(--geo-red); }
+
+.addin-modal[hidden] { display: none; }
+.addin-modal {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+}
+.addin-modal__backdrop {
+  position: absolute; inset: 0; background: rgba(0,0,0,.4);
+}
+.addin-modal__panel {
+  position: relative; background: #fff; border-radius: var(--radius-lg);
+  box-shadow: 0 10px 40px rgba(0,0,0,.25);
+  width: min(560px, 92vw); max-height: 86vh; display: flex; flex-direction: column;
+}
+.addin-modal__header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--geo-grey-200);
+}
+.addin-modal__header h2 { margin: 0; font-size: 16px; }
+.addin-modal__close {
+  background: none; border: none; font-size: 22px; cursor: pointer; color: var(--geo-grey-600);
+}
+.addin-modal__body { padding: 14px 16px; overflow: auto; }
+.addin-modal__footer {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 10px 16px; border-top: 1px solid var(--geo-grey-200);
+}
+.addin-form-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px;
+}
+.addin-form-grid .addin-field { min-width: 0; }
+.addin-form-grid .full { grid-column: 1 / -1; }
+
+.addin-import-summary { font-size: 13px; }
+.addin-import-summary li { margin: 2px 0; }
+.addin-import-error { color: var(--geo-red); }

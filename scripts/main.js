@@ -1,0 +1,1161 @@
+/* global geotab */
+/*
+ * Fuel Transactions Bulk Editor — main.js
+ *
+ * Lessons applied from BUILD_GUIDE.md / BUILDING_A_GENERIC_ADDIN.md:
+ *  - shim window.geotab before assignment
+ *  - callback() invoked unconditionally in initialize
+ *  - blur() aborts in-flight, clears timers; unload() full teardown
+ *  - all bulk writes via api.multiCall, chunked at MULTICALL_CHUNK = 100,
+ *    SEQUENTIAL chunks (to respect the 100/min/user rate cap)
+ *  - escapeHtml() before any innerHTML; textContent preferred otherwise
+ *  - whitelist enums (productType, currencyCode) before composing entities
+ *  - optimistic-concurrency: keep `version` from Get; on Set failure re-Get and resurface
+ *  - modal a11y: toggle [hidden] + [inert] + aria-hidden; restore focus on close
+ *  - standalone bootstrap shim at bottom for file:// preview
+ */
+(function () {
+  'use strict';
+  if (typeof window !== 'undefined' && typeof window.geotab === 'undefined') {
+    window.geotab = { addin: {} };
+  }
+})();
+
+geotab.addin.fuelBulkEditor = function () {
+  'use strict';
+
+  // ── Constants ────────────────────────────────────────────────────────────
+  const MULTICALL_CHUNK = 100;            // BUILD_GUIDE §6
+  const RESULTS_LIMIT   = 50000;          // matches official fuel-tracker-edit
+  const L_PER_GAL_US    = 3.785411784;
+  const KM_PER_MI       = 1.609344;
+
+  const PRODUCT_TYPES = Object.freeze([
+    'Unknown', 'Regular', 'Midgrade', 'Premium', 'Super',
+    'Diesel', 'DieselExhaustFluid', 'E85', 'CNG', 'LPG',
+    'Electric', 'Hydrogen', 'NonFuel'
+  ]);
+  const CURRENCIES = Object.freeze([
+    'USD', 'CAD', 'GBP', 'EUR', 'AUD', 'MXN', 'JPY', 'PHP', 'INR', 'BRL'
+  ]);
+  // Editable on FuelTransaction Set (others are server-controlled or pass-through).
+  const EDITABLE_FIELDS = Object.freeze([
+    'dateTime', 'volume', 'cost', 'currencyCode',
+    'odometer', 'productType', 'comments'
+  ]);
+
+  // ── State ────────────────────────────────────────────────────────────────
+  let api = null;
+  let state = null;
+  const ui = {
+    initialized: false,
+    inflight: new Set(),       // AbortController-like { abort() } shims
+    rows: [],                  // current loaded FuelTransactions (canonical/raw shape)
+    edited: new Map(),         // id -> patch object (pending UI edits)
+    selected: new Set(),       // selected row ids
+    sortKey: 'dateTime',
+    sortDir: 'desc',
+    deviceById: new Map(),     // deviceId -> name
+    driverById: new Map(),     // driverId -> name
+    volUnit: 'L',
+    odoUnit: 'km',
+    lastFocusEl: null          // for modal focus restoration
+  };
+
+  // ── DOM helpers ──────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+  function setStatus(msg, kind) {
+    const el = $('ftbe-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.classList.remove('is-error', 'is-success');
+    if (kind === 'error')   el.classList.add('is-error');
+    if (kind === 'success') el.classList.add('is-success');
+  }
+
+  // ── API plumbing ─────────────────────────────────────────────────────────
+  // Wraps api.call in a Promise + tracks a cancel handle in ui.inflight.
+  function apiCall(method, params) {
+    if (!api || typeof api.call !== 'function') {
+      return Promise.reject(new Error('API unavailable (standalone preview)'));
+    }
+    let cancelled = false;
+    const handle = { abort() { cancelled = true; } };
+    ui.inflight.add(handle);
+    return new Promise((resolve, reject) => {
+      try {
+        api.call(method, params,
+          (res) => { ui.inflight.delete(handle); if (!cancelled) resolve(res); },
+          (err) => { ui.inflight.delete(handle); if (!cancelled) reject(err); });
+      } catch (e) { ui.inflight.delete(handle); reject(e); }
+    });
+  }
+
+  // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK — BUILD_GUIDE §6 / §7.6.
+  // Validates each sub-call argument; the server aborts a whole batch on one bad shape.
+  function apiMultiCall(calls) {
+    if (!api || typeof api.multiCall !== 'function') {
+      return Promise.reject(new Error('multiCall unavailable'));
+    }
+    const valid = calls.filter((c) => Array.isArray(c) && typeof c[0] === 'string' && c[1] && typeof c[1] === 'object');
+    if (valid.length !== calls.length) {
+      return Promise.reject(new Error('multiCall: malformed sub-call detected; refusing to send.'));
+    }
+    const chunks = [];
+    for (let i = 0; i < valid.length; i += MULTICALL_CHUNK) {
+      chunks.push(valid.slice(i, i + MULTICALL_CHUNK));
+    }
+    return chunks.reduce((p, chunk) => p.then((acc) => new Promise((resolve) => {
+      const handle = { abort() {} };
+      ui.inflight.add(handle);
+      api.multiCall(chunk,
+        (results) => { ui.inflight.delete(handle); resolve(acc.concat(results || [])); },
+        (err)     => { ui.inflight.delete(handle); resolve(acc.concat(chunk.map(() => ({ __error: err })))); }
+      );
+    })), Promise.resolve([]));
+  }
+
+  // ── Unit + format helpers ────────────────────────────────────────────────
+  function fromDisplayVolume(v) { return ui.volUnit === 'gal' ? v * L_PER_GAL_US : v; }
+  function toDisplayVolume(v)   { return ui.volUnit === 'gal' ? v / L_PER_GAL_US : v; }
+  function fromDisplayOdo(v)    { return ui.odoUnit === 'mi'  ? v * KM_PER_MI    : v; }
+  function toDisplayOdo(v)      { return ui.odoUnit === 'mi'  ? v / KM_PER_MI    : v; }
+  function fmtNum(v, digits)    { return v == null || isNaN(v) ? '' : Number(v).toFixed(digits != null ? digits : 2); }
+  function fmtDateTime(iso) {
+    if (!iso) return '';
+    try { return new Date(iso).toLocaleString(); } catch (_) { return String(iso); }
+  }
+  function isoToLocalInput(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+           'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function localInputToIso(s) {
+    if (!s) return null;
+    const d = new Date(s);
+    return isNaN(d) ? null : d.toISOString();
+  }
+
+  // ── Reference data loaders ───────────────────────────────────────────────
+  function loadReferenceData() {
+    const calls = [
+      ['Get', { typeName: 'Device', resultsLimit: 10000 }],
+      ['Get', { typeName: 'Driver', resultsLimit: 10000 }]
+    ];
+    return apiMultiCall(calls).then((results) => {
+      const devices = (results && results[0]) || [];
+      const drivers = (results && results[1]) || [];
+      ui.deviceById.clear();
+      ui.driverById.clear();
+      devices.forEach((d) => { if (d && d.id) ui.deviceById.set(d.id, d.name || d.id); });
+      drivers.forEach((d) => {
+        if (d && d.id) ui.driverById.set(d.id, [d.firstName, d.lastName].filter(Boolean).join(' ') || d.name || d.id);
+      });
+      populateSelect($('ftbe-device'), ui.deviceById, 'All devices');
+      populateSelect($('ftbe-driver'), ui.driverById, 'All drivers');
+    }).catch((err) => {
+      console.warn('[fuelBulkEditor] reference data load failed', err);
+    });
+  }
+  function populateSelect(sel, map, allLabel) {
+    if (!sel) return;
+    while (sel.options.length > 1) sel.remove(1);
+    sel.options[0].text = allLabel;
+    const items = Array.from(map.entries()).sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+    items.forEach(([id, name]) => {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    });
+  }
+
+  // ── Fuel transactions: load ──────────────────────────────────────────────
+  function loadTransactions() {
+    const fromIso = localInputToIso($('ftbe-from').value);
+    const toIso   = localInputToIso($('ftbe-to').value);
+    if (!fromIso || !toIso) {
+      setStatus('Pick a valid From and To date.', 'error');
+      return;
+    }
+    const search = { fromDate: fromIso, toDate: toIso };
+    const devId = $('ftbe-device').value;
+    const drvId = $('ftbe-driver').value;
+    if (devId) search.deviceSearch = { id: devId };
+    if (drvId) search.driverSearch = { id: drvId };
+
+    setStatus('Loading transactions…');
+    ui.rows = [];
+    ui.edited.clear();
+    ui.selected.clear();
+    renderTable();
+
+    apiCall('Get', { typeName: 'FuelTransaction', search, resultsLimit: RESULTS_LIMIT })
+      .then((rows) => {
+        ui.rows = Array.isArray(rows) ? rows : [];
+        applySortAndRender();
+        setStatus(ui.rows.length + ' transactions loaded.', 'success');
+      })
+      .catch((err) => {
+        setStatus('Load failed: ' + (err && err.message ? err.message : err), 'error');
+      });
+  }
+
+  // ── Filter / sort / render ───────────────────────────────────────────────
+  // HAR-confirmed: r.driver may be the bare string "UnknownDriverId" OR an
+  // object { id }. Normalise both cases so downstream code can rely on it.
+  function driverIdOf(r) {
+    if (!r || r.driver == null) return null;
+    if (typeof r.driver === 'string') return r.driver;
+    return r.driver.id || null;
+  }
+  function deviceIdOf(r) {
+    if (!r || r.device == null) return null;
+    if (typeof r.device === 'string') return r.device;
+    return r.device.id || null;
+  }
+
+  function deriveDisplayRows() {
+    const q = ($('ftbe-search').value || '').trim().toLowerCase();
+    const arr = ui.rows.map((r) => {
+      const devId = deviceIdOf(r);
+      const drvId = driverIdOf(r);
+      return {
+        raw: r,
+        id: r.id,
+        version: r.version,
+        dateTime: r.dateTime,
+        deviceId: devId,
+        deviceName: (devId && ui.deviceById.get(devId)) || r.description || '',
+        driverId: drvId,
+        driverName: r.driverName || (drvId && ui.driverById.get(drvId)) || '',
+        productType: r.productType,
+        volume: typeof r.volume === 'number' ? r.volume : null,
+        cost: typeof r.cost === 'number' ? r.cost : null,
+        currencyCode: r.currencyCode || '',
+        odometer: typeof r.odometer === 'number' ? r.odometer : null,
+        siteName: r.siteName || '',
+        cardNumber: r.cardNumber || '',
+        comments: r.comments || ''
+      };
+    });
+    const filtered = q ? arr.filter((d) => {
+      return [d.driverName, d.siteName, d.comments, d.cardNumber, d.deviceName]
+        .some((v) => String(v).toLowerCase().indexOf(q) !== -1);
+    }) : arr;
+    const dir = ui.sortDir === 'asc' ? 1 : -1;
+    const k = ui.sortKey;
+    filtered.sort((a, b) => {
+      const av = a[k], bv = b[k];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+      return String(av).localeCompare(String(bv)) * dir;
+    });
+    return filtered;
+  }
+
+  function renderTable() {
+    const tbody = $('ftbe-tbody');
+    if (!tbody) return;
+    const rows = deriveDisplayRows();
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="13" class="addin-empty">No transactions match.</td></tr>';
+      updateBulkButtons();
+      updateSortIndicators();
+      return;
+    }
+    const html = rows.map((d) => {
+      const isSel = ui.selected.has(d.id);
+      const isEdited = ui.edited.has(d.id);
+      const patch = ui.edited.get(d.id) || {};
+      const vol = patch.volume != null ? patch.volume : d.volume;
+      const cost = patch.cost != null ? patch.cost : d.cost;
+      const odo = patch.odometer != null ? patch.odometer : d.odometer;
+      const cur = patch.currencyCode != null ? patch.currencyCode : d.currencyCode;
+      const prod = patch.productType != null ? patch.productType : d.productType;
+      const cmt = patch.comments != null ? patch.comments : d.comments;
+      const dt  = patch.dateTime != null ? patch.dateTime : d.dateTime;
+      return '<tr data-id="' + escapeHtml(d.id) + '"' +
+             (isSel ? ' class="is-selected"' : '') +
+             (isEdited ? ' class="is-edited"' : '') + '>' +
+        '<td class="addin-col-check"><input type="checkbox" class="ftbe-row-check" ' +
+            (isSel ? 'checked' : '') + ' aria-label="Select row"></td>' +
+        '<td>' + escapeHtml(fmtDateTime(dt)) + '</td>' +
+        '<td>' + escapeHtml(d.deviceName) + '</td>' +
+        '<td>' + escapeHtml(d.driverName) + '</td>' +
+        '<td>' + escapeHtml(prod || '') + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(vol != null ? fmtNum(toDisplayVolume(vol), 3) : '') + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(cost != null ? fmtNum(cost, 2) : '') + '</td>' +
+        '<td>' + escapeHtml(cur || '') + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(odo != null ? fmtNum(toDisplayOdo(odo), 0) : '') + '</td>' +
+        '<td>' + escapeHtml(d.siteName) + '</td>' +
+        '<td>' + escapeHtml(d.cardNumber) + '</td>' +
+        '<td>' + escapeHtml(cmt) + '</td>' +
+        '<td class="addin-col-actions">' +
+          '<button type="button" class="addin-row-btn" data-action="edit">Edit</button>' +
+          (isEdited ? ' <button type="button" class="addin-row-btn" data-action="revert">Revert</button>' : '') +
+          ' <button type="button" class="addin-row-btn addin-row-btn--danger" data-action="delete">Delete</button>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+    tbody.innerHTML = html;
+    updateBulkButtons();
+    updateSortIndicators();
+    const dirtyCount = ui.edited.size;
+    if (dirtyCount > 0) {
+      setStatus(dirtyCount + ' pending edit(s). Click "Save edits" to commit.');
+      ensureSaveEditsButton();
+    } else {
+      removeSaveEditsButton();
+    }
+  }
+
+  function updateSortIndicators() {
+    const ths = document.querySelectorAll('#ftbe-table thead th[data-sort]');
+    ths.forEach((th) => {
+      th.classList.remove('is-sort-asc', 'is-sort-desc');
+      if (th.getAttribute('data-sort') === ui.sortKey) {
+        th.classList.add(ui.sortDir === 'asc' ? 'is-sort-asc' : 'is-sort-desc');
+      }
+    });
+  }
+
+  function applySortAndRender() { renderTable(); }
+
+  function updateBulkButtons() {
+    const has = ui.selected.size > 0;
+    $('ftbe-bulk-edit').disabled = !has;
+    $('ftbe-bulk-delete').disabled = !has;
+    const all = $('ftbe-check-all');
+    if (all) {
+      const total = deriveDisplayRows().length;
+      all.checked = total > 0 && ui.selected.size === total;
+      all.indeterminate = ui.selected.size > 0 && ui.selected.size < total;
+    }
+  }
+
+  function ensureSaveEditsButton() {
+    if ($('ftbe-save-edits')) return;
+    const btn = document.createElement('button');
+    btn.id = 'ftbe-save-edits';
+    btn.className = 'btn btn--primary';
+    btn.type = 'button';
+    btn.textContent = 'Save edits';
+    btn.addEventListener('click', saveAllEdits);
+    const row = document.querySelector('.addin-toolbar__row--secondary');
+    if (row) row.appendChild(btn);
+  }
+  function removeSaveEditsButton() {
+    const btn = $('ftbe-save-edits');
+    if (btn) btn.remove();
+  }
+
+  // ── Validation ───────────────────────────────────────────────────────────
+  function sanitizePatch(patch) {
+    // Whitelist enums + coerce numerics. Defence-in-depth (BUILD_GUIDE §7 / Phase 7).
+    const out = {};
+    for (const k of Object.keys(patch)) {
+      if (EDITABLE_FIELDS.indexOf(k) === -1) continue;
+      const v = patch[k];
+      if (v === '' || v == null) continue;
+      if (k === 'productType') {
+        if (PRODUCT_TYPES.indexOf(v) === -1) continue;
+        out.productType = v;
+      } else if (k === 'currencyCode') {
+        if (!/^[A-Z]{3}$/.test(v)) continue;
+        out.currencyCode = v;
+      } else if (k === 'volume' || k === 'cost' || k === 'odometer') {
+        const n = Number(v);
+        if (!isFinite(n) || n < 0) continue;
+        out[k] = n;
+      } else if (k === 'dateTime') {
+        const d = new Date(v);
+        if (isNaN(d)) continue;
+        out.dateTime = d.toISOString();
+      } else if (k === 'comments') {
+        out.comments = String(v).slice(0, 1024);
+      }
+    }
+    return out;
+  }
+
+  // ── Single-row edit modal ────────────────────────────────────────────────
+  function openEditModal(id) {
+    const row = ui.rows.find((r) => r.id === id);
+    if (!row) return;
+    const patch = ui.edited.get(id) || {};
+    const cur = (k) => patch[k] != null ? patch[k] : row[k];
+    const body = $('ftbe-modal-body');
+    body.innerHTML =
+      '<div class="addin-form-grid">' +
+        '<label class="addin-field"><span>Date / time</span>' +
+          '<input type="datetime-local" id="ftbe-edit-dateTime" value="' + escapeHtml(isoToLocalInput(cur('dateTime'))) + '"></label>' +
+        '<label class="addin-field"><span>Product</span>' +
+          '<select id="ftbe-edit-productType">' +
+            PRODUCT_TYPES.map((p) => '<option value="' + escapeHtml(p) + '"' +
+              (cur('productType') === p ? ' selected' : '') + '>' + escapeHtml(p) + '</option>').join('') +
+          '</select></label>' +
+        '<label class="addin-field"><span>Volume (' + escapeHtml(ui.volUnit) + ')</span>' +
+          '<input type="number" step="0.001" min="0" id="ftbe-edit-volume" value="' +
+          escapeHtml(cur('volume') != null ? fmtNum(toDisplayVolume(cur('volume')), 3) : '') + '"></label>' +
+        '<label class="addin-field"><span>Cost</span>' +
+          '<input type="number" step="0.01" min="0" id="ftbe-edit-cost" value="' +
+          escapeHtml(cur('cost') != null ? fmtNum(cur('cost'), 2) : '') + '"></label>' +
+        '<label class="addin-field"><span>Currency</span>' +
+          '<select id="ftbe-edit-currencyCode">' +
+            CURRENCIES.map((c) => '<option value="' + escapeHtml(c) + '"' +
+              (cur('currencyCode') === c ? ' selected' : '') + '>' + escapeHtml(c) + '</option>').join('') +
+          '</select></label>' +
+        '<label class="addin-field"><span>Odometer (' + escapeHtml(ui.odoUnit) + ')</span>' +
+          '<input type="number" step="1" min="0" id="ftbe-edit-odometer" value="' +
+          escapeHtml(cur('odometer') != null ? fmtNum(toDisplayOdo(cur('odometer')), 0) : '') + '"></label>' +
+        '<label class="addin-field full"><span>Comments</span>' +
+          '<textarea id="ftbe-edit-comments" rows="3" maxlength="1024">' +
+          escapeHtml(cur('comments') || '') + '</textarea></label>' +
+      '</div>';
+    $('ftbe-modal-title').textContent = 'Edit transaction';
+    showModal(() => {
+      const raw = {
+        dateTime:     localInputToIso($('ftbe-edit-dateTime').value),
+        productType:  $('ftbe-edit-productType').value,
+        volume:       $('ftbe-edit-volume').value !== '' ? fromDisplayVolume(Number($('ftbe-edit-volume').value)) : '',
+        cost:         $('ftbe-edit-cost').value !== '' ? Number($('ftbe-edit-cost').value) : '',
+        currencyCode: $('ftbe-edit-currencyCode').value,
+        odometer:     $('ftbe-edit-odometer').value !== '' ? fromDisplayOdo(Number($('ftbe-edit-odometer').value)) : '',
+        comments:     $('ftbe-edit-comments').value
+      };
+      const clean = sanitizePatch(raw);
+      const existing = ui.edited.get(id) || {};
+      ui.edited.set(id, Object.assign({}, existing, clean));
+      renderTable();
+    });
+  }
+
+  // ── Bulk-edit modal ──────────────────────────────────────────────────────
+  function openBulkEditModal() {
+    if (!ui.selected.size) return;
+    const body = $('ftbe-modal-body');
+    body.innerHTML =
+      '<p>Apply changes to <b>' + ui.selected.size + '</b> selected transaction(s). ' +
+        'Leave a field blank to leave it unchanged.</p>' +
+      '<div class="addin-form-grid">' +
+        '<label class="addin-field"><span>Product</span>' +
+          '<select id="ftbe-bulk-productType"><option value="">— unchanged —</option>' +
+            PRODUCT_TYPES.map((p) => '<option value="' + escapeHtml(p) + '">' + escapeHtml(p) + '</option>').join('') +
+          '</select></label>' +
+        '<label class="addin-field"><span>Currency</span>' +
+          '<select id="ftbe-bulk-currencyCode"><option value="">— unchanged —</option>' +
+            CURRENCIES.map((c) => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('') +
+          '</select></label>' +
+        '<label class="addin-field"><span>Set volume (' + escapeHtml(ui.volUnit) + ')</span>' +
+          '<input type="number" step="0.001" min="0" id="ftbe-bulk-volume"></label>' +
+        '<label class="addin-field"><span>Set cost</span>' +
+          '<input type="number" step="0.01" min="0" id="ftbe-bulk-cost"></label>' +
+        '<label class="addin-field"><span>Set odometer (' + escapeHtml(ui.odoUnit) + ')</span>' +
+          '<input type="number" step="1" min="0" id="ftbe-bulk-odometer"></label>' +
+        '<label class="addin-field full"><span>Append to comments</span>' +
+          '<input type="text" id="ftbe-bulk-comments-append" maxlength="512"></label>' +
+      '</div>';
+    $('ftbe-modal-title').textContent = 'Bulk edit ' + ui.selected.size + ' transaction(s)';
+    showModal(() => {
+      const raw = {
+        productType:  $('ftbe-bulk-productType').value,
+        currencyCode: $('ftbe-bulk-currencyCode').value,
+        volume:       $('ftbe-bulk-volume').value !== '' ? fromDisplayVolume(Number($('ftbe-bulk-volume').value)) : '',
+        cost:         $('ftbe-bulk-cost').value !== '' ? Number($('ftbe-bulk-cost').value) : '',
+        odometer:     $('ftbe-bulk-odometer').value !== '' ? fromDisplayOdo(Number($('ftbe-bulk-odometer').value)) : ''
+      };
+      const append = ($('ftbe-bulk-comments-append').value || '').trim();
+      const clean = sanitizePatch(raw);
+      if (!Object.keys(clean).length && !append) return;
+      ui.selected.forEach((id) => {
+        const existing = ui.edited.get(id) || {};
+        const row = ui.rows.find((r) => r.id === id) || {};
+        const merged = Object.assign({}, existing, clean);
+        if (append) {
+          const base = existing.comments != null ? existing.comments : (row.comments || '');
+          merged.comments = (base ? base + ' ' : '') + append;
+          merged.comments = String(merged.comments).slice(0, 1024);
+        }
+        ui.edited.set(id, merged);
+      });
+      renderTable();
+    });
+  }
+
+  // ── Save pending edits (multiCall, sequential, optimistic concurrency) ───
+  function saveAllEdits() {
+    if (!ui.edited.size) return;
+    const entries = Array.from(ui.edited.entries());
+    const calls = [];
+    const callIdToTxId = [];
+    for (const [id, patch] of entries) {
+      const row = ui.rows.find((r) => r.id === id);
+      if (!row) continue;
+      const entity = Object.assign({}, row, sanitizePatch(patch));
+      // Ensure required identity + concurrency fields:
+      entity.id = row.id;
+      entity.version = row.version;
+      // Driver shape: Geotab returns the bare string "UnknownDriverId" when
+      // no driver is assigned, and the object { id } when one is. Pass
+      // through unchanged; default to "UnknownDriverId" if missing entirely.
+      // (Do NOT wrap the unknown-driver string in an object — that's wrong.)
+      if (entity.driver == null) entity.driver = 'UnknownDriverId';
+      if (typeof entity.device === 'string') entity.device = { id: entity.device };
+      // sourceData must be a string (preserve as-is or empty string).
+      if (entity.sourceData != null && typeof entity.sourceData !== 'string') {
+        try { entity.sourceData = JSON.stringify(entity.sourceData); } catch (_) { entity.sourceData = ''; }
+      }
+      if (!entity.id) continue;
+      calls.push(['Set', { typeName: 'FuelTransaction', entity }]);
+      callIdToTxId.push(id);
+    }
+    if (!calls.length) return;
+    setStatus('Saving ' + calls.length + ' edit(s)…');
+    apiMultiCall(calls).then((results) => {
+      let ok = 0, fail = 0;
+      const failures = [];
+      results.forEach((res, idx) => {
+        if (res && res.__error) { fail++; failures.push({ id: callIdToTxId[idx], err: res.__error }); }
+        else { ok++; ui.edited.delete(callIdToTxId[idx]); }
+      });
+      if (fail) {
+        setStatus(ok + ' saved, ' + fail + ' failed. Reloading to refresh versions…', 'error');
+        console.warn('[fuelBulkEditor] save failures', failures);
+      } else {
+        setStatus(ok + ' edit(s) saved.', 'success');
+      }
+      // Re-Get so stale `version` tokens refresh (optimistic-concurrency hygiene).
+      loadTransactions();
+    }).catch((err) => {
+      setStatus('Save failed: ' + (err && err.message ? err.message : err), 'error');
+    });
+  }
+
+  // ── Delete ───────────────────────────────────────────────────────────────
+  function deleteRows(ids) {
+    if (!ids.length) return;
+    if (!confirm('Delete ' + ids.length + ' transaction(s)? This cannot be undone.')) return;
+    const calls = ids.map((id) => ['Remove', { typeName: 'FuelTransaction', entity: { id } }]);
+    setStatus('Deleting ' + calls.length + '…');
+    apiMultiCall(calls).then((results) => {
+      const fail = results.filter((r) => r && r.__error).length;
+      const ok = results.length - fail;
+      ui.selected.clear();
+      ids.forEach((id) => ui.edited.delete(id));
+      setStatus(ok + ' deleted' + (fail ? (', ' + fail + ' failed') : ''), fail ? 'error' : 'success');
+      loadTransactions();
+    });
+  }
+
+  // ── CSV export ───────────────────────────────────────────────────────────
+  const CSV_COLUMNS = Object.freeze([
+    { key: 'id',                          header: 'id' },
+    { key: 'version',                     header: 'version' },
+    { key: 'dateTime',                    header: 'dateTime' },
+    { key: 'deviceId',                    header: 'deviceId' },
+    { key: 'deviceName',                  header: 'deviceName' },
+    { key: 'driverId',                    header: 'driverId' },
+    { key: 'driverName',                  header: 'driverName' },
+    { key: 'productType',                 header: 'productType' },
+    { key: 'volumeLiters',                header: 'volumeLiters' },
+    { key: 'cost',                        header: 'cost' },
+    { key: 'currencyCode',                header: 'currencyCode' },
+    { key: 'odometerKm',                  header: 'odometerKm' },
+    { key: 'siteName',                    header: 'siteName' },
+    { key: 'cardNumber',                  header: 'cardNumber' },
+    { key: 'comments',                    header: 'comments' },
+    { key: 'externalReference',           header: 'externalReference' },
+    { key: 'provider',                    header: 'provider' },
+    { key: 'licencePlate',                header: 'licencePlate' },
+    { key: 'vehicleIdentificationNumber', header: 'vehicleIdentificationNumber' }
+  ]);
+
+  function exportCsv() {
+    if (!ui.rows.length) { setStatus('Nothing to export.', 'error'); return; }
+    const data = (ui.selected.size ? ui.rows.filter((r) => ui.selected.has(r.id)) : ui.rows)
+      .map((r) => ({
+        id: r.id,
+        version: r.version || '',
+        dateTime: r.dateTime || '',
+        deviceId: deviceIdOf(r) || '',
+        deviceName: (deviceIdOf(r) && ui.deviceById.get(deviceIdOf(r))) || r.description || '',
+        driverId: driverIdOf(r) || '',
+        driverName: r.driverName || (driverIdOf(r) && ui.driverById.get(driverIdOf(r))) || '',
+        productType: r.productType || '',
+        volumeLiters: r.volume != null ? r.volume : '',
+        cost: r.cost != null ? r.cost : '',
+        currencyCode: r.currencyCode || '',
+        odometerKm: r.odometer != null ? r.odometer : '',
+        siteName: r.siteName || '',
+        cardNumber: r.cardNumber || '',
+        comments: r.comments || '',
+        externalReference: r.externalReference || '',
+        provider: r.provider || '',
+        licencePlate: r.licencePlate || '',
+        vehicleIdentificationNumber: r.vehicleIdentificationNumber || ''
+      }));
+    const text = window.CSVUtil.serialize(data, CSV_COLUMNS);
+    const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    a.download = 'fuel-transactions-' + stamp + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+    setStatus('Exported ' + data.length + ' row(s).', 'success');
+  }
+
+  // ── CSV import (bulk-edit upload) ────────────────────────────────────────
+  function onImportFileChosen(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || '');
+        const parsed = window.CSVUtil.parse(text);
+        applyImport(parsed);
+      } catch (err) {
+        setStatus('CSV parse failed: ' + (err && err.message ? err.message : err), 'error');
+      }
+    };
+    reader.onerror = () => setStatus('Could not read CSV file.', 'error');
+    reader.readAsText(file);
+  }
+
+  // External-format header aliases (case-insensitive). Maps third-party
+  // fuel-card CSV columns to FuelTransaction field names.
+  const EXTERNAL_HEADER_ALIASES = Object.freeze({
+    'date & time':                    'dateTime',
+    'datetime':                       'dateTime',
+    'vehicle identification number':  'vehicleIdentificationNumber',
+    'vin':                            'vehicleIdentificationNumber',
+    'serial number':                  'serialNumber',
+    'license plate':                  'licencePlate',
+    'licence plate':                  'licencePlate',
+    'vehicle description':            'description',
+    'cardholder':                     'driverName',
+    'card number':                    'cardNumber',
+    'volume (l)':                     'volume',
+    'volume':                         'volume',
+    'cost':                           'cost',
+    'currency code':                  'currencyCode',
+    'product type':                   'productType',
+    'transaction odometer':           'odometer',
+    'odometer':                       'odometer',
+    'location address':               'siteAddress',
+    'site name':                      'siteName',
+    'comments':                       'comments'
+  });
+
+  // Lightweight productType synonym map. Anything else falls through to
+  // sanitizePatch's whitelist (and gets rejected if not a known enum).
+  const PRODUCT_TYPE_SYNONYMS = Object.freeze({
+    'gasoline':         'Regular',
+    'gas':              'Regular',
+    'unleaded':         'Regular',
+    'regular unleaded': 'Regular',
+    'premium gasoline': 'Premium',
+    'mid-grade':        'Midgrade',
+    'midgrade':         'Midgrade',
+    'diesel fuel':      'Diesel',
+    'def':              'DieselExhaustFluid'
+  });
+
+  function stripCommas(s) { return typeof s === 'string' ? s.replace(/,/g, '') : s; }
+
+  // Normalises a row from an external CSV into FuelTransaction-shaped fields.
+  function normalizeExternalRow(headers, row) {
+    const out = {};
+    for (const h of headers) {
+      const key = EXTERNAL_HEADER_ALIASES[h.toLowerCase()];
+      if (!key) continue;
+      let v = row[h];
+      if (v == null || v === '') continue;
+      if (key === 'volume' || key === 'cost' || key === 'odometer') v = stripCommas(v);
+      if (key === 'productType') {
+        const syn = PRODUCT_TYPE_SYNONYMS[String(v).toLowerCase()];
+        if (syn) v = syn;
+      }
+      out[key] = v;
+    }
+    return out;
+  }
+
+  // Detect format. id-based = round-trip workflow; external = third-party feed.
+  function detectCsvFormat(headers) {
+    const lc = headers.map((h) => h.toLowerCase());
+    if (lc.indexOf('id') !== -1) return 'id-based';
+    const hasExternalKey = lc.some((h) => [
+      'vehicle identification number', 'vin',
+      'serial number', 'license plate', 'licence plate'
+    ].indexOf(h) !== -1);
+    return hasExternalKey ? 'external' : 'unknown';
+  }
+
+  // Match CSV rows against loaded FuelTransactions by VIN → Serial → Plate,
+  // narrowed by dateTime delta (default ±5 min). Returns {matched, unmatched, ambiguous}.
+  function matchExternalRows(externalRows, fuelTx, opts) {
+    const toleranceMs = (opts && opts.toleranceMinutes ? opts.toleranceMinutes : 5) * 60 * 1000;
+
+    // Build indices once for O(1) candidate narrowing.
+    const byVin    = new Map();
+    const bySerial = new Map();
+    const byPlate  = new Map();
+    const pushTo = (map, key, tx) => {
+      if (!key) return;
+      const k = String(key).toUpperCase().trim();
+      if (!k) return;
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(tx);
+    };
+    fuelTx.forEach((tx) => {
+      pushTo(byVin,    tx.vehicleIdentificationNumber, tx);
+      pushTo(bySerial, tx.serialNumber,                tx);
+      pushTo(byPlate,  tx.licencePlate,                tx);
+    });
+
+    const matched = [];     // [{ csvRow, tx, reason }]
+    const unmatched = [];   // [{ csvRow, reason }]
+    const ambiguous = [];   // [{ csvRow, candidates }]
+
+    externalRows.forEach((csvRow) => {
+      const csvIsoSrc = csvRow.dateTime;
+      const csvIso = csvIsoSrc ? new Date(csvIsoSrc) : null;
+      if (csvIso && isNaN(csvIso)) { unmatched.push({ csvRow, reason: 'bad dateTime' }); return; }
+
+      const tryKey = (map, raw, label) => {
+        if (!raw) return null;
+        const k = String(raw).toUpperCase().trim();
+        const candidates = map.get(k) || [];
+        if (!candidates.length) return null;
+        if (!csvIso) {
+          // No timestamp — only acceptable if exactly one candidate.
+          return candidates.length === 1 ? { tx: candidates[0], reason: label + ' (no dateTime; unique)' } : { __amb: candidates };
+        }
+        const inWindow = candidates.filter((tx) => {
+          if (!tx.dateTime) return false;
+          return Math.abs(new Date(tx.dateTime) - csvIso) <= toleranceMs;
+        });
+        if (!inWindow.length) return null;
+        if (inWindow.length === 1) return { tx: inWindow[0], reason: label };
+        // Prefer the closest in time.
+        inWindow.sort((a, b) => Math.abs(new Date(a.dateTime) - csvIso) - Math.abs(new Date(b.dateTime) - csvIso));
+        return { tx: inWindow[0], reason: label + ' (closest of ' + inWindow.length + ')' };
+      };
+
+      const hit =
+        tryKey(byVin,    csvRow.vehicleIdentificationNumber, 'VIN') ||
+        tryKey(bySerial, csvRow.serialNumber,                'Serial') ||
+        tryKey(byPlate,  csvRow.licencePlate,                'Plate');
+      if (!hit) { unmatched.push({ csvRow, reason: 'no VIN/Serial/Plate match within ±' + (toleranceMs / 60000) + ' min' }); return; }
+      if (hit.__amb) { ambiguous.push({ csvRow, candidates: hit.__amb }); return; }
+      matched.push({ csvRow, tx: hit.tx, reason: hit.reason });
+    });
+    return { matched, unmatched, ambiguous };
+  }
+
+  function applyImport(parsed) {
+    if (!parsed || !parsed.headers || !parsed.headers.length) {
+      setStatus('CSV appears empty.', 'error'); return;
+    }
+    const format = detectCsvFormat(parsed.headers);
+    if (format === 'unknown') {
+      setStatus('CSV needs either an "id" column (round-trip) or VIN / Serial Number / License Plate columns.', 'error');
+      return;
+    }
+    if (format === 'external') { return applyExternalImport(parsed); }
+    // Index current rows by id for diffing + version lookup.
+    const byId = new Map();
+    ui.rows.forEach((r) => byId.set(r.id, r));
+
+    const calls = [];
+    const callIdToRowIdx = [];
+    let unknownIds = 0, unchanged = 0;
+    parsed.rows.forEach((row, idx) => {
+      const id = (row.id || '').trim();
+      if (!id) return;
+      const live = byId.get(id);
+      if (!live) { unknownIds++; return; }
+      const patch = {};
+      if (row.dateTime)         patch.dateTime = row.dateTime;
+      if (row.productType)      patch.productType = row.productType;
+      if (row.volumeLiters !== '' && row.volumeLiters != null) patch.volume = row.volumeLiters;
+      if (row.cost !== '' && row.cost != null)                 patch.cost = row.cost;
+      if (row.currencyCode)     patch.currencyCode = row.currencyCode;
+      if (row.odometerKm !== '' && row.odometerKm != null)     patch.odometer = row.odometerKm;
+      if (row.comments != null) patch.comments = row.comments;
+      const clean = sanitizePatch(patch);
+      // Drop fields where new === current to keep call payload lean.
+      for (const k of Object.keys(clean)) {
+        if (live[k] === clean[k]) delete clean[k];
+      }
+      if (!Object.keys(clean).length) { unchanged++; return; }
+      const entity = Object.assign({}, live, clean, { id: live.id, version: live.version });
+      if (entity.driver == null) entity.driver = 'UnknownDriverId';
+      if (typeof entity.device === 'string') entity.device = { id: entity.device };
+      if (entity.sourceData != null && typeof entity.sourceData !== 'string') {
+        try { entity.sourceData = JSON.stringify(entity.sourceData); } catch (_) { entity.sourceData = ''; }
+      }
+      calls.push(['Set', { typeName: 'FuelTransaction', entity }]);
+      callIdToRowIdx.push({ id, idx });
+    });
+
+    if (!calls.length) {
+      setStatus('No changes to apply (' + unknownIds + ' unknown id(s), ' + unchanged + ' unchanged).', 'error');
+      return;
+    }
+    setStatus('Applying ' + calls.length + ' update(s) from CSV…');
+    apiMultiCall(calls).then((results) => {
+      const failures = [];
+      let ok = 0;
+      results.forEach((res, i) => {
+        if (res && res.__error) failures.push({ id: callIdToRowIdx[i].id, err: res.__error });
+        else ok++;
+      });
+      const summary =
+        ok + ' updated, ' +
+        failures.length + ' failed, ' +
+        unknownIds + ' unknown id(s), ' +
+        unchanged + ' unchanged.';
+      showImportSummary(summary, failures);
+      loadTransactions();   // re-Get to refresh version tokens
+    });
+  }
+
+  // External-format import: match by VIN/Serial/Plate + dateTime, then stage
+  // edits against the Geotab-assigned `id` + `version`. Server actions still
+  // happen via chunked sequential multiCall.
+  function applyExternalImport(parsed) {
+    const externals = parsed.rows
+      .map((row) => normalizeExternalRow(parsed.headers, row))
+      .filter((r) => r.vehicleIdentificationNumber || r.serialNumber || r.licencePlate);
+    if (!externals.length) {
+      setStatus('No usable rows (need VIN, Serial, or Plate).', 'error'); return;
+    }
+    // Derive a date window (±1 day padding) from CSV dateTime values, if any.
+    const validDates = externals.map((r) => r.dateTime ? new Date(r.dateTime) : null).filter((d) => d && !isNaN(d));
+    let needFetch = false;
+    let fromIso, toIso;
+    if (validDates.length) {
+      const minMs = Math.min.apply(null, validDates.map((d) => d.getTime())) - 24 * 3600 * 1000;
+      const maxMs = Math.max.apply(null, validDates.map((d) => d.getTime())) + 24 * 3600 * 1000;
+      fromIso = new Date(minMs).toISOString();
+      toIso   = new Date(maxMs).toISOString();
+      needFetch = true;
+    }
+
+    // HAR-confirmed: FuelTransactionSearch accepts a top-level
+    // vehicleIdentificationNumber filter server-side (undocumented but used
+    // by the Drive App). Prefer per-VIN multiCall when the CSV has VINs —
+    // far less data than a wide date-window pull.
+    const uniqueVins = Array.from(new Set(
+      externals.map((r) => (r.vehicleIdentificationNumber || '').trim()).filter(Boolean)
+    ));
+    const canUseServerVinSearch = uniqueVins.length > 0 && uniqueVins.length <= 100 && needFetch;
+
+    const finishMatch = () => {
+      const result = matchExternalRows(externals, ui.rows);
+      // Stage every matched record as a pending edit (keyed by Geotab id) and
+      // select them so the user can review, then commit via Save edits.
+      ui.selected.clear();
+      result.matched.forEach(({ csvRow, tx }) => {
+        const patch = sanitizePatch({
+          dateTime:     csvRow.dateTime,
+          productType:  csvRow.productType,
+          volume:       csvRow.volume,
+          cost:         csvRow.cost,
+          currencyCode: csvRow.currencyCode,
+          odometer:     csvRow.odometer,
+          comments:     csvRow.comments
+        });
+        // Drop no-op fields so we don't dirty rows where the value already matches.
+        for (const k of Object.keys(patch)) { if (tx[k] === patch[k]) delete patch[k]; }
+        if (Object.keys(patch).length) {
+          const existing = ui.edited.get(tx.id) || {};
+          ui.edited.set(tx.id, Object.assign({}, existing, patch));
+        }
+        ui.selected.add(tx.id);   // makes Delete matched + bulk-edit available
+      });
+      renderTable();
+      showExternalMatchSummary(result);
+    };
+
+    if (canUseServerVinSearch) {
+      setStatus('Fetching FuelTransactions by VIN (' + uniqueVins.length + ')…');
+      const calls = uniqueVins.map((vin) => ['Get', {
+        typeName: 'FuelTransaction',
+        search: { fromDate: fromIso, toDate: toIso, vehicleIdentificationNumber: vin },
+        resultsLimit: 10000
+      }]);
+      apiMultiCall(calls).then((results) => {
+        const merged = [];
+        const seen = new Set();
+        results.forEach((bucket) => {
+          if (bucket && bucket.__error) return;
+          (bucket || []).forEach((tx) => {
+            if (tx && tx.id && !seen.has(tx.id)) { seen.add(tx.id); merged.push(tx); }
+          });
+        });
+        ui.rows = merged;
+        if (fromIso) $('ftbe-from').value = isoToLocalInput(fromIso);
+        if (toIso)   $('ftbe-to').value   = isoToLocalInput(toIso);
+        finishMatch();
+      }).catch((err) => {
+        setStatus('Per-VIN fetch failed: ' + (err && err.message ? err.message : err), 'error');
+      });
+    } else if (needFetch) {
+      setStatus('Fetching FuelTransactions over CSV date window…');
+      apiCall('Get', {
+        typeName: 'FuelTransaction',
+        search: { fromDate: fromIso, toDate: toIso },
+        resultsLimit: RESULTS_LIMIT
+      }).then((rows) => {
+        ui.rows = Array.isArray(rows) ? rows : [];
+        if (fromIso) $('ftbe-from').value = isoToLocalInput(fromIso);
+        if (toIso)   $('ftbe-to').value   = isoToLocalInput(toIso);
+        finishMatch();
+      }).catch((err) => {
+        setStatus('Fetch failed: ' + (err && err.message ? err.message : err), 'error');
+      });
+    } else {
+      // No timestamps in CSV — match against whatever's already loaded.
+      if (!ui.rows.length) {
+        setStatus('CSV has no dateTime values; load a date range first so the script has records to match against.', 'error');
+        return;
+      }
+      finishMatch();
+    }
+  }
+
+  function showExternalMatchSummary(result) {
+    $('ftbe-modal-title').textContent = 'CSV match summary';
+    const body = $('ftbe-modal-body');
+    const reasonsHtml = result.matched.slice(0, 25).map((m) =>
+      '<li><code>' + escapeHtml(m.tx.id) + '</code> ← ' +
+        escapeHtml(m.csvRow.vehicleIdentificationNumber || m.csvRow.serialNumber || m.csvRow.licencePlate || '(no key)') +
+        ' <span style="color:var(--geo-grey-600)">[' + escapeHtml(m.reason) + ']</span></li>'
+    ).join('');
+    const unmatchedHtml = result.unmatched.slice(0, 25).map((u) =>
+      '<li class="addin-import-error">' +
+        escapeHtml(u.csvRow.vehicleIdentificationNumber || u.csvRow.serialNumber || u.csvRow.licencePlate || '(no key)') +
+        ' — ' + escapeHtml(u.reason) + '</li>'
+    ).join('');
+    const ambHtml = result.ambiguous.slice(0, 10).map((a) =>
+      '<li>' + escapeHtml(a.csvRow.vehicleIdentificationNumber || a.csvRow.serialNumber || a.csvRow.licencePlate || '') +
+        ' — ' + a.candidates.length + ' candidates (need dateTime to disambiguate)</li>'
+    ).join('');
+
+    body.innerHTML =
+      '<p class="addin-import-summary"><b>' + result.matched.length + '</b> matched, ' +
+        '<b>' + result.unmatched.length + '</b> unmatched, ' +
+        '<b>' + result.ambiguous.length + '</b> ambiguous.</p>' +
+      '<p>Matched rows are now selected and staged with edits. Click <b>Save edits</b> ' +
+        'to commit via the Geotab-assigned <code>id</code> + <code>version</code>, or ' +
+        '<b>Delete selected</b> to remove them.</p>' +
+      (reasonsHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Matches</h3><ul class="addin-import-summary">' + reasonsHtml + '</ul>' : '') +
+      (unmatchedHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Unmatched</h3><ul class="addin-import-summary">' + unmatchedHtml + '</ul>' : '') +
+      (ambHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Ambiguous</h3><ul class="addin-import-summary">' + ambHtml + '</ul>' : '');
+    showModal(null, true);
+  }
+
+  function showImportSummary(summary, failures) {
+    $('ftbe-modal-title').textContent = 'CSV import summary';
+    const body = $('ftbe-modal-body');
+    let html = '<p class="addin-import-summary">' + escapeHtml(summary) + '</p>';
+    if (failures && failures.length) {
+      html += '<ul class="addin-import-summary">' +
+        failures.slice(0, 25).map((f) =>
+          '<li class="addin-import-error">' +
+            '<code>' + escapeHtml(f.id) + '</code>: ' +
+            escapeHtml(f.err && (f.err.message || f.err.name) || String(f.err)) +
+          '</li>'
+        ).join('') +
+        (failures.length > 25 ? '<li>… and ' + (failures.length - 25) + ' more</li>' : '') +
+      '</ul>';
+    }
+    body.innerHTML = html;
+    showModal(null, true);
+  }
+
+  // ── Modal a11y ───────────────────────────────────────────────────────────
+  function showModal(onSave, infoOnly) {
+    const modal = $('ftbe-modal');
+    if (!modal) return;
+    ui.lastFocusEl = document.activeElement;
+    modal.hidden = false;
+    modal.removeAttribute('inert');
+    modal.setAttribute('aria-hidden', 'false');
+    const saveBtn = $('ftbe-modal-save');
+    if (infoOnly) {
+      saveBtn.style.display = 'none';
+    } else {
+      saveBtn.style.display = '';
+      saveBtn.onclick = () => {
+        try { if (onSave) onSave(); } finally { hideModal(); }
+      };
+    }
+    // Focus first focusable inside the panel for keyboard users.
+    const firstField = modal.querySelector('.addin-modal__body input, .addin-modal__body select, .addin-modal__body textarea, .addin-modal__body button');
+    if (firstField) setTimeout(() => firstField.focus(), 0);
+  }
+  function hideModal() {
+    const modal = $('ftbe-modal');
+    if (!modal) return;
+    modal.hidden = true;
+    modal.setAttribute('inert', '');
+    modal.setAttribute('aria-hidden', 'true');
+    const saveBtn = $('ftbe-modal-save');
+    if (saveBtn) saveBtn.onclick = null;
+    if (ui.lastFocusEl && typeof ui.lastFocusEl.focus === 'function') {
+      try { ui.lastFocusEl.focus(); } catch (_) {}
+    }
+    ui.lastFocusEl = null;
+  }
+
+  // ── Default date range (last 30 days) ────────────────────────────────────
+  function setDefaultDateRange() {
+    const now = new Date();
+    const from = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    const toLocal = (d) =>
+      d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    if (!$('ftbe-from').value) $('ftbe-from').value = toLocal(from);
+    if (!$('ftbe-to').value)   $('ftbe-to').value   = toLocal(now);
+  }
+
+  // ── Wiring ───────────────────────────────────────────────────────────────
+  function bindControls() {
+    $('ftbe-load').addEventListener('click', loadTransactions);
+    $('ftbe-export-csv').addEventListener('click', exportCsv);
+    $('ftbe-import-csv').addEventListener('click', () => $('ftbe-file').click());
+    $('ftbe-file').addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      onImportFileChosen(f);
+      e.target.value = '';
+    });
+    $('ftbe-search').addEventListener('input', () => renderTable());
+    $('ftbe-vol-unit').addEventListener('change', (e) => { ui.volUnit = e.target.value; renderTable(); });
+    $('ftbe-odo-unit').addEventListener('change', (e) => { ui.odoUnit = e.target.value; renderTable(); });
+
+    $('ftbe-bulk-edit').addEventListener('click', openBulkEditModal);
+    $('ftbe-bulk-delete').addEventListener('click', () => deleteRows(Array.from(ui.selected)));
+
+    // Sort headers
+    document.querySelectorAll('#ftbe-table thead th[data-sort]').forEach((th) => {
+      th.addEventListener('click', () => {
+        const k = th.getAttribute('data-sort');
+        if (ui.sortKey === k) ui.sortDir = ui.sortDir === 'asc' ? 'desc' : 'asc';
+        else { ui.sortKey = k; ui.sortDir = 'asc'; }
+        applySortAndRender();
+      });
+    });
+
+    // Select all
+    $('ftbe-check-all').addEventListener('change', (e) => {
+      const rows = deriveDisplayRows();
+      if (e.target.checked) rows.forEach((r) => ui.selected.add(r.id));
+      else ui.selected.clear();
+      renderTable();
+    });
+
+    // Delegated tbody handler — survives re-renders.
+    $('ftbe-tbody').addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-id]');
+      if (!tr) return;
+      const id = tr.getAttribute('data-id');
+      if (e.target.classList && e.target.classList.contains('ftbe-row-check')) {
+        if (e.target.checked) ui.selected.add(id); else ui.selected.delete(id);
+        updateBulkButtons();
+        tr.classList.toggle('is-selected', e.target.checked);
+        return;
+      }
+      if (e.target.matches('button[data-action]')) {
+        const action = e.target.getAttribute('data-action');
+        if (action === 'edit')   openEditModal(id);
+        if (action === 'revert') { ui.edited.delete(id); renderTable(); }
+        if (action === 'delete') deleteRows([id]);
+      }
+    });
+
+    // Modal close handlers
+    document.querySelectorAll('#ftbe-modal [data-modal-close]').forEach((el) => {
+      el.addEventListener('click', hideModal);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !$('ftbe-modal').hidden) hideModal();
+    });
+  }
+
+  // ── Public lifecycle ─────────────────────────────────────────────────────
+  return {
+    initialize: function (freshApi, freshState, callback) {
+      api = freshApi;
+      state = freshState;
+      try {
+        if (!ui.initialized) {
+          bindControls();
+          setDefaultDateRange();
+          ui.initialized = true;
+        }
+        // Reference data: best-effort; failure should not block load button.
+        try { loadReferenceData(); } catch (e) { console.warn(e); }
+      } catch (err) {
+        console.error('[fuelBulkEditor] initialize failed', err);
+      }
+      if (typeof callback === 'function') callback();   // MANDATORY
+    },
+
+    focus: function (freshApi, freshState) {
+      api = freshApi;
+      state = freshState;
+      // Sticky-header table is the only size-aware element; re-render in
+      // case the iframe was display:none during blur.
+      requestAnimationFrame(() => renderTable());
+    },
+
+    blur: function () {
+      ui.inflight.forEach((c) => { try { c.abort(); } catch (_) {} });
+      ui.inflight.clear();
+    },
+
+    unload: function () {
+      this.blur();
+      ui.rows = [];
+      ui.edited.clear();
+      ui.selected.clear();
+      ui.deviceById.clear();
+      ui.driverById.clear();
+      const tbody = $('ftbe-tbody');
+      if (tbody) tbody.innerHTML = '';
+      api = null;
+      state = null;
+      ui.initialized = false;
+    }
+  };
+};
+
+// ── Standalone bootstrap (file:// preview) ─────────────────────────────────
+(function () {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  if (window.geotab && window.geotab.api) return;   // running inside MyGeotab
+  document.addEventListener('DOMContentLoaded', () => {
+    if (window.__fuelBulkEditorBootstrapped) return;
+    window.__fuelBulkEditorBootstrapped = true;
+    const lifecycle = window.geotab.addin.fuelBulkEditor();
+    const stubApi = { getSession: (cb) => cb(null) };
+    lifecycle.initialize(stubApi, {}, () => lifecycle.focus(stubApi, {}));
+  });
+})();

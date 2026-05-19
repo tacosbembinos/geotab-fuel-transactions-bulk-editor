@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self';
+                 script-src 'self';
+                 style-src 'self' 'unsafe-inline';
+                 img-src 'self' data: blob: https:;
+                 connect-src 'self' https:;
+                 font-src 'self' data:;
+                 frame-ancestors 'self' https://*.geotab.com https://my.geotab.com;
+                 base-uri 'self';
+                 object-src 'none';
+                 form-action 'self';">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+
+  <title>Fuel Transactions Bulk Editor</title>
+  <link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+
+<div class="addin-root" id="fuel-bulk-editor-root">
+  <header class="addin-header">
+    <div class="addin-header__title geotabPageName">Fuel Transactions Bulk Editor</div>
+    <div class="addin-header__subtitle">View, search, export, and bulk-edit FuelTransactions.</div>
+  </header>
+
+  <section class="card addin-toolbar">
+    <div class="addin-toolbar__row">
+      <label class="addin-field">
+        <span>From</span>
+        <input type="datetime-local" id="ftbe-from">
+      </label>
+      <label class="addin-field">
+        <span>To</span>
+        <input type="datetime-local" id="ftbe-to">
+      </label>
+      <label class="addin-field">
+        <span>Device</span>
+        <select id="ftbe-device"><option value="">All devices</option></select>
+      </label>
+      <label class="addin-field">
+        <span>Driver</span>
+        <select id="ftbe-driver"><option value="">All drivers</option></select>
+      </label>
+      <label class="addin-field">
+        <span>Search</span>
+        <input type="text" id="ftbe-search" placeholder="site, comments, card, driver name">
+      </label>
+      <label class="addin-field addin-field--inline">
+        <span>Display volume</span>
+        <select id="ftbe-vol-unit">
+          <option value="L">Liters</option>
+          <option value="gal">US Gallons</option>
+        </select>
+      </label>
+      <label class="addin-field addin-field--inline">
+        <span>Display odometer</span>
+        <select id="ftbe-odo-unit">
+          <option value="km">Kilometers</option>
+          <option value="mi">Miles</option>
+        </select>
+      </label>
+      <button class="btn btn--primary" id="ftbe-load">Load</button>
+      <button class="btn" id="ftbe-export-csv">Export CSV</button>
+      <button class="btn" id="ftbe-import-csv">Import CSV…</button>
+      <input type="file" id="ftbe-file" accept=".csv,text/csv" class="visually-hidden">
+    </div>
+    <div class="addin-toolbar__row addin-toolbar__row--secondary">
+      <span class="addin-status" id="ftbe-status">Idle.</span>
+      <span class="addin-spacer"></span>
+      <button class="btn" id="ftbe-bulk-edit" disabled>Bulk edit selected…</button>
+      <button class="btn btn--danger" id="ftbe-bulk-delete" disabled>Delete selected</button>
+    </div>
+  </section>
+
+  <section class="card addin-table-wrap">
+    <table class="addin-table" id="ftbe-table">
+      <thead>
+        <tr>
+          <th class="addin-col-check"><input type="checkbox" id="ftbe-check-all" aria-label="Select all"></th>
+          <th data-sort="dateTime">Date / Time</th>
+          <th data-sort="deviceName">Device</th>
+          <th data-sort="driverName">Driver</th>
+          <th data-sort="productType">Product</th>
+          <th data-sort="volume" class="addin-col-num">Volume</th>
+          <th data-sort="cost" class="addin-col-num">Cost</th>
+          <th data-sort="currencyCode">Cur</th>
+          <th data-sort="odometer" class="addin-col-num">Odometer</th>
+          <th data-sort="siteName">Site</th>
+          <th data-sort="cardNumber">Card</th>
+          <th>Comments</th>
+          <th class="addin-col-actions">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ftbe-tbody">
+        <tr><td colspan="13" class="addin-empty">No transactions loaded. Choose a date range and click Load.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="addin-modal" id="ftbe-modal" hidden inert aria-hidden="true">
+    <div class="addin-modal__backdrop" data-modal-close></div>
+    <div class="addin-modal__panel" role="dialog" aria-modal="true" aria-labelledby="ftbe-modal-title">
+      <header class="addin-modal__header">
+        <h2 id="ftbe-modal-title">Edit</h2>
+        <button class="addin-modal__close" data-modal-close aria-label="Close">×</button>
+      </header>
+      <div class="addin-modal__body" id="ftbe-modal-body"></div>
+      <footer class="addin-modal__footer">
+        <button class="btn" data-modal-close>Cancel</button>
+        <button class="btn btn--primary" id="ftbe-modal-save">Save</button>
+      </footer>
+    </div>
+  </div>
+</div>
+
+<script src="scripts/csv.js"></script>
+<script src="scripts/main.js"></script>
+
+</body>
+</html>
