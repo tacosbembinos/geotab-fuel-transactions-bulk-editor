@@ -117,6 +117,19 @@ geotab.addin.fuelBulkEditor = function () {
   // sub-calls were emitted at time t. We prune entries older than windowMs.
   const rateState = { events: [] };
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  // Single-flight gate: only ONE api.call / api.multiCall is in flight at a
+  // time. The next request waits for the prior to settle (success OR error)
+  // before being issued. This is the hard guarantee the throttle relies on —
+  // without it, two callers can both pass awaitCapacity() in the same tick,
+  // both call recordSubcalls(), and double-emit before the ledger reflects
+  // either one. With it, the rate-window math always sees a consistent state.
+  let apiGate = Promise.resolve();
+  function withApiGate(fn) {
+    const run = apiGate.then(fn, fn);
+    apiGate = run.then(() => {}, () => {});
+    return run;
+  }
   function pruneRateEvents(now) {
     const cutoff = now - RATE_LIMIT.windowMs;
     while (rateState.events.length && rateState.events[0].t < cutoff) rateState.events.shift();
@@ -151,14 +164,57 @@ geotab.addin.fuelBulkEditor = function () {
     }
   }
 
+  // Walks the entire error envelope. The MyGeotab SDK has delivered OverLimit
+  // in three shapes the wild: top-level `{name: 'OverLimitException', ...}`,
+  // wrapped `{error: {errors: [{name: 'OverLimitException'}]}, requestIndex: 0}`,
+  // and the per-subcall inline form returned via multiCall's success callback.
+  // A shallow check on err.name misses the latter two; a recursive dig catches
+  // all of them. Bounded by depth + a cycle guard.
+  const OVER_LIMIT_RX = /OverLimitException|quota exceeded/i;
   function isOverLimitError(err) {
-    if (!err) return false;
-    const bag = [
-      err.name, err.message, err.type,
-      err.data && err.data.type,
-      err.data && err.data.name
-    ].filter(Boolean).join(' ');
-    return /OverLimitException/i.test(bag) || /quota exceeded/i.test(bag);
+    if (err == null) return false;
+    const seen = new Set();
+    function dig(node, depth) {
+      if (node == null || depth > 6) return false;
+      if (typeof node === 'string') return OVER_LIMIT_RX.test(node);
+      if (typeof node !== 'object') return false;
+      if (seen.has(node)) return false;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        for (const item of node) if (dig(item, depth + 1)) return true;
+        return false;
+      }
+      for (const k of ['name', 'message', 'type']) {
+        if (node[k] != null && OVER_LIMIT_RX.test(String(node[k]))) return true;
+      }
+      for (const k of ['error', 'data', 'cause']) {
+        if (k in node && dig(node[k], depth + 1)) return true;
+      }
+      if (Array.isArray(node.errors)) {
+        for (const e of node.errors) if (dig(e, depth + 1)) return true;
+      }
+      return false;
+    }
+    return dig(err, 0);
+  }
+
+  // Inspect a multiCall success result for inline JSON-RPC error envelopes.
+  // `api.multiCall` may invoke the SUCCESS callback with an array where each
+  // element is either a real result OR `{error: {...}, requestIndex: N}` — the
+  // HAR shows this shape with OverLimitException. Without this check we'd
+  // treat a fully-failed batch as success and immediately fire the next one.
+  function inlineMultiCallErrors(results) {
+    if (!Array.isArray(results)) return null;
+    const errs = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r && typeof r === 'object' && r.error) {
+        errs.push({ index: i, err: r.error });
+      }
+    }
+    if (!errs.length) return null;
+    const overLimit = errs.some((e) => isOverLimitError(e.err));
+    return { errs, overLimit, firstErr: errs[0].err };
   }
 
   // Parse "Maximum admitted N per Wm" / "...per Ws" out of the JSON-RPC error
@@ -215,8 +271,13 @@ geotab.addin.fuelBulkEditor = function () {
           if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
           await awaitCapacity(1, handle);
           if (handle.aborted) throw CANCELLED;
-          recordSubcalls(1);
-          const out = await invoke();
+          // Single-flight: the call below cannot start until any prior api
+          // request has settled. recordSubcalls is moved inside the gate so
+          // the ledger is updated atomically with the actual emission.
+          const out = await withApiGate(async () => {
+            recordSubcalls(1);
+            return invoke();
+          });
           if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
           if (out.ok) return out.res;
           if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
@@ -224,7 +285,9 @@ geotab.addin.fuelBulkEditor = function () {
             const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
             setStatus('Rate limit hit. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
             await sleep(waitMs);
-            rateState.events.length = 0;     // server window has reset
+            // Do NOT clear rateState.events — they prune naturally once older
+            // than windowMs, and clearing lets the next attempt skip throttling
+            // when other tabs are still consuming the same per-tenant bucket.
             attempt++;
             continue;
           }
@@ -294,28 +357,58 @@ geotab.addin.fuelBulkEditor = function () {
               for (let k = 0; k < rest; k++) all.push(CANCELLED);
               return all;
             }
-            recordSubcalls(chunk.length);
             if (label && chunks.length > 1) {
               setStatus(label + ' — ' + done + ' / ' + total +
                         ' (chunk ' + (idx + 1) + ' of ' + chunks.length + ')…');
             }
-            const out = await sendChunk(chunk);
-            if (out.ok) {
-              all.push.apply(all, out.results);
-              done += chunk.length;
-              break;
-            }
-            if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
-              parseQuotaFromMessage(out.err);
-              const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
+            // Single-flight + atomic ledger update: the next multiCall is
+            // not dispatched until the previous one fully settles. This is
+            // the load-bearing guarantee the task asks for — "only send the
+            // next multiCall when the last one is completed."
+            const out = await withApiGate(async () => {
+              recordSubcalls(chunk.length);
+              return sendChunk(chunk);
+            });
+            // multiCall can deliver per-subcall errors via either callback.
+            // Treat both paths uniformly.
+            const inline = out.ok ? inlineMultiCallErrors(out.results) : null;
+            const overLimit =
+              (!out.ok && isOverLimitError(out.err)) ||
+              (inline && inline.overLimit);
+            if (overLimit && attempt < RATE_LIMIT.maxRetries) {
+              const errForMsg = out.ok ? inline.firstErr : out.err;
+              parseQuotaFromMessage(errForMsg);
+              const waitMs = Math.floor(parseRetryAfterMs(errForMsg) * Math.pow(1.25, attempt));
               setStatus('Rate limit hit on chunk ' + (idx + 1) + ' / ' + chunks.length +
                         '. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
               await sleep(waitMs);
-              rateState.events.length = 0;
+              // Keep rateState.events intact — the cooldown is >= windowMs so
+              // they prune naturally on the next awaitCapacity() pass, and
+              // leaving them shields against per-tenant buckets shared with
+              // other tabs that may still be draining the quota.
               attempt++;
               continue;
             }
-            // Non-rate-limit failure (or retries exhausted): mark per-subcall.
+            if (out.ok) {
+              if (inline) {
+                // Some subcalls have non-rate-limit errors. Surface each one
+                // as __error in its original position so the caller's
+                // results.forEach((res, idx) => ...) sees them.
+                for (let i = 0; i < out.results.length; i++) {
+                  const r = out.results[i];
+                  if (r && typeof r === 'object' && r.error) {
+                    all.push({ __error: r.error });
+                  } else {
+                    all.push(r);
+                  }
+                }
+              } else {
+                all.push.apply(all, out.results);
+              }
+              done += chunk.length;
+              break;
+            }
+            // Transport-level failure (and not OverLimit, or retries exhausted).
             for (let k = 0; k < chunk.length; k++) all.push({ __error: out.err });
             done += chunk.length;
             break;
