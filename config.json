@@ -1,7 +1,7 @@
 {
   "name": "Fuel Transactions Bulk Editor",
   "supportEmail": "abembridge@advtracking.net",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "items": [
     {
       "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/fuelBulkEditor.html",

@@ -22,93 +22,120 @@
        (document origin = jsDelivr) and inline-into-<main> mode (document
        origin = my.geotab.com). Bump the @main tag to a release tag when
        cutting versions so customers aren't pinned to a moving HEAD. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/styles/main.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/styles/main.css?v=1.0.3">
 </head>
 <body>
 
 <div class="addin-root" id="fuel-bulk-editor-root">
+
   <header class="addin-header">
-    <div class="addin-header__title geotabPageName">Fuel Transactions Bulk Editor</div>
-    <div class="addin-header__subtitle">View, search, export, and bulk-edit FuelTransactions.</div>
+    <div class="addin-header__icon" aria-hidden="true">
+      <svg viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.4">
+        <path d="M3.5 13.5V3.5A1 1 0 0 1 4.5 2.5h4A1 1 0 0 1 9.5 3.5v10" stroke-linejoin="round"/>
+        <path d="M3 13.5h7" stroke-linecap="round"/>
+        <path d="M9.5 6.5h2L13 8v3.5a1 1 0 0 1-1 1h-.5" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="11.5" cy="12.5" r="1"/>
+      </svg>
+    </div>
+    <div class="addin-header__titleblock">
+      <div class="addin-header__title geotabPageName">Fuel Transactions Bulk Editor</div>
+      <div class="addin-header__subtitle">View, search, export, and bulk-edit FuelTransactions</div>
+    </div>
   </header>
 
-  <section class="card addin-toolbar">
-    <div class="addin-toolbar__row">
-      <label class="addin-field">
-        <span>From</span>
-        <input type="datetime-local" id="ftbe-from">
-      </label>
-      <label class="addin-field">
-        <span>To</span>
-        <input type="datetime-local" id="ftbe-to">
-      </label>
-      <label class="addin-field">
-        <span>Device</span>
-        <select id="ftbe-device"><option value="">All devices</option></select>
-      </label>
-      <label class="addin-field">
-        <span>Driver</span>
-        <select id="ftbe-driver"><option value="">All drivers</option></select>
-      </label>
-      <label class="addin-field">
-        <span>Search</span>
-        <input type="text" id="ftbe-search" placeholder="site, comments, card, driver name">
-      </label>
-      <label class="addin-field addin-field--inline">
-        <span>Display volume</span>
-        <select id="ftbe-vol-unit">
-          <option value="L">Liters</option>
-          <option value="gal">US Gallons</option>
-        </select>
-      </label>
-      <label class="addin-field addin-field--inline">
-        <span>Display odometer</span>
-        <select id="ftbe-odo-unit">
-          <option value="km">Kilometers</option>
-          <option value="mi">Miles</option>
-        </select>
-      </label>
-      <button class="btn btn--primary" id="ftbe-load">Load</button>
-      <button class="btn" id="ftbe-export-csv">Export CSV</button>
-      <button class="btn" id="ftbe-import-csv">Import CSV…</button>
-      <button class="btn" id="ftbe-match-csv" title="Use a CSV to look up existing FuelTransactions — no Set/Upload">Match on CSV…</button>
-      <button class="btn btn--danger" id="ftbe-force-import" title="Add every CSV row as a new FuelTransaction. Bypasses the VIN/Serial/Plate matcher.">Force Import…</button>
-      <input type="file" id="ftbe-file" accept=".csv,text/csv" class="visually-hidden">
-      <input type="file" id="ftbe-file-match" accept=".csv,text/csv" class="visually-hidden">
-      <input type="file" id="ftbe-file-force" accept=".csv,text/csv" class="visually-hidden">
-    </div>
-    <div class="addin-toolbar__row addin-toolbar__row--secondary">
-      <span class="addin-status" id="ftbe-status">Idle.</span>
-      <span class="addin-spacer"></span>
-      <button class="btn" id="ftbe-bulk-edit" disabled>Bulk edit selected…</button>
-      <button class="btn btn--danger" id="ftbe-bulk-delete" disabled>Delete selected</button>
-    </div>
-  </section>
+  <div class="addin-body">
 
-  <section class="card addin-table-wrap">
-    <table class="addin-table" id="ftbe-table">
-      <thead>
-        <tr>
-          <th class="addin-col-check"><input type="checkbox" id="ftbe-check-all" aria-label="Select all"></th>
-          <th data-sort="dateTime">Date / Time</th>
-          <th data-sort="deviceName">Device</th>
-          <th data-sort="driverName">Driver</th>
-          <th data-sort="productType">Product</th>
-          <th data-sort="volume" class="addin-col-num">Volume</th>
-          <th data-sort="cost" class="addin-col-num">Cost</th>
-          <th data-sort="currencyCode">Cur</th>
-          <th data-sort="odometer" class="addin-col-num">Odometer</th>
-          <th data-sort="siteName">Site</th>
-          <th data-sort="cardNumber">Card</th>
-          <th>Comments</th>
-          <th class="addin-col-actions">Actions</th>
-        </tr>
-      </thead>
-      <tbody id="ftbe-tbody">
-        <tr><td colspan="13" class="addin-empty">No transactions loaded. Choose a date range and click Load.</td></tr>
-      </tbody>
-    </table>
-  </section>
+    <section class="card addin-toolbar" aria-label="Filters and actions">
+      <div class="card__header">
+        <span class="card__title">Filters</span>
+        <div class="card__actions">
+          <button class="btn btn--primary" id="ftbe-load">Load</button>
+          <button class="btn" id="ftbe-export-csv">Export CSV</button>
+          <button class="btn" id="ftbe-import-csv">Import CSV…</button>
+          <button class="btn" id="ftbe-match-csv" title="Use a CSV to look up existing FuelTransactions — no Set/Upload">Match on CSV…</button>
+          <button class="btn btn--danger" id="ftbe-force-import" title="Add every CSV row as a new FuelTransaction. Bypasses the VIN/Serial/Plate matcher.">Force Import…</button>
+          <input type="file" id="ftbe-file"       accept=".csv,text/csv" class="visually-hidden">
+          <input type="file" id="ftbe-file-match" accept=".csv,text/csv" class="visually-hidden">
+          <input type="file" id="ftbe-file-force" accept=".csv,text/csv" class="visually-hidden">
+        </div>
+      </div>
+
+      <div class="addin-toolbar__row">
+        <label class="addin-field">
+          <span>From</span>
+          <input type="datetime-local" id="ftbe-from">
+        </label>
+        <label class="addin-field">
+          <span>To</span>
+          <input type="datetime-local" id="ftbe-to">
+        </label>
+        <label class="addin-field">
+          <span>Device</span>
+          <select id="ftbe-device"><option value="">All devices</option></select>
+        </label>
+        <label class="addin-field">
+          <span>Driver</span>
+          <select id="ftbe-driver"><option value="">All drivers</option></select>
+        </label>
+        <label class="addin-field">
+          <span>Search</span>
+          <input type="text" id="ftbe-search" placeholder="site, comments, card, driver name">
+        </label>
+        <label class="addin-field addin-field--inline">
+          <span>Volume unit</span>
+          <select id="ftbe-vol-unit">
+            <option value="L">Liters</option>
+            <option value="gal">US Gallons</option>
+          </select>
+        </label>
+        <label class="addin-field addin-field--inline">
+          <span>Odometer unit</span>
+          <select id="ftbe-odo-unit">
+            <option value="km">Kilometers</option>
+            <option value="mi">Miles</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="addin-toolbar__row addin-toolbar__row--secondary">
+        <span class="addin-status" id="ftbe-status" role="status" aria-live="polite">Idle.</span>
+        <span class="addin-spacer"></span>
+        <button class="btn" id="ftbe-bulk-edit" disabled>Bulk edit selected…</button>
+        <button class="btn btn--danger" id="ftbe-bulk-delete" disabled>Delete selected</button>
+      </div>
+    </section>
+
+    <section class="card card--flex" aria-label="Transactions">
+      <div class="card__header">
+        <span class="card__title">Transactions</span>
+      </div>
+      <div class="card__body card__body--flush card__body--scroll addin-table-wrap">
+        <table class="addin-table" id="ftbe-table">
+          <thead>
+            <tr>
+              <th class="addin-col-check"><input type="checkbox" id="ftbe-check-all" aria-label="Select all"></th>
+              <th data-sort="dateTime">Date / Time</th>
+              <th data-sort="deviceName">Device</th>
+              <th data-sort="driverName">Driver</th>
+              <th data-sort="productType">Product</th>
+              <th data-sort="volume"   class="addin-col-num">Volume</th>
+              <th data-sort="cost"     class="addin-col-num">Cost</th>
+              <th data-sort="currencyCode">Cur</th>
+              <th data-sort="odometer" class="addin-col-num">Odometer</th>
+              <th data-sort="siteName">Site</th>
+              <th data-sort="cardNumber">Card</th>
+              <th>Comments</th>
+              <th class="addin-col-actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ftbe-tbody">
+            <tr><td colspan="13" class="addin-empty">No transactions loaded. Choose a date range and click Load.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
 
   <div class="addin-modal" id="ftbe-modal" hidden inert aria-hidden="true">
     <div class="addin-modal__backdrop" data-modal-close></div>
@@ -126,8 +153,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/csv.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/main.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/csv.js?v=1.0.3"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/main.js?v=1.0.3"></script>
 
 </body>
 </html>
