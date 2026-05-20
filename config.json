@@ -5,7 +5,7 @@
   "items": [
     {
       "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/fuelBulkEditor.html",
-      "path": "EngineMaintenanceLink/",
+      "path": "SustainabilityId/",
       "menuName": { "en": "Fuel Transactions Bulk Editor" },
       "icon": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/images/icon.svg",
       "menuHeader": false,
