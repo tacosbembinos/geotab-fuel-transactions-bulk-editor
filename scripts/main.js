@@ -72,6 +72,7 @@ geotab.addin.fuelBulkEditor = function () {
     selected: new Set(),       // selected row ids
     unmatchedPreview: [],      // CSV rows with no FT match — shown grey at top of table; ⇒ Force Import
     duplicateTargets: new Map(), // tx.id -> count of CSV rows that matched it (>1 = warning)
+    lastMatchCounts: null,     // { matched, unmatched, ambiguous } from the most recent CSV import/lookup — drives summary tiles
     sortKey: 'dateTime',
     sortDir: 'desc',
     deviceById: new Map(),     // deviceId -> name
@@ -737,6 +738,7 @@ geotab.addin.fuelBulkEditor = function () {
     updateBulkButtons();
     updateSortIndicators();
     updateLegendStrip();
+    updateSummaryTiles();
     const dirtyCount = ui.edited.size;
     if (dirtyCount > 0) {
       setStatus(dirtyCount + ' pending edit(s). Click "Save edits" to commit.');
@@ -797,6 +799,41 @@ geotab.addin.fuelBulkEditor = function () {
     if (clearBtn) clearBtn.addEventListener('click', () => {
       ui.unmatchedPreview = [];
       renderTable();
+    });
+  }
+
+  // ── Zenith summary tiles ────────────────────────────────────────────────
+  // The 5 tiles above the table give a single-glance answer to "what is the
+  // editor showing me right now?" Each tile's `data-empty` attribute drives
+  // the colour change in CSS — a non-zero count flips it from the neutral
+  // default skin to its semantic accent (warning / success / error / active).
+  function updateSummaryTiles() {
+    const m = ui.lastMatchCounts;
+    const counts = {
+      loaded:    ui.rows.length,
+      selected:  ui.selected.size,
+      pending:   ui.edited.size,
+      matched:   m ? m.matched   : 0,
+      unmatched: m ? m.unmatched : 0
+    };
+    const ids = {
+      loaded: 'ftbe-tile-loaded',
+      selected: 'ftbe-tile-selected',
+      pending: 'ftbe-tile-pending',
+      matched: 'ftbe-tile-matched',
+      unmatched: 'ftbe-tile-unmatched'
+    };
+    Object.keys(ids).forEach((key) => {
+      const tile = $(ids[key]);
+      if (!tile) return;
+      const n = counts[key];
+      const valEl = tile.querySelector('[data-count]');
+      if (valEl) valEl.textContent = String(n);
+      // Loaded tile is informational only — never tinted. The other four
+      // tiles tint when their count is meaningful (>0).
+      if (key === 'loaded') return;
+      if (n > 0) tile.removeAttribute('data-empty');
+      else       tile.setAttribute('data-empty', 'true');
     });
   }
 
@@ -1559,6 +1596,11 @@ geotab.addin.fuelBulkEditor = function () {
       // real data — answers "what is the CSV trying to add that I'm missing?"
       // without forcing the user back to the modal.
       ui.unmatchedPreview = result.unmatched.slice();
+      ui.lastMatchCounts = {
+        matched:   result.matched.length,
+        unmatched: result.unmatched.length,
+        ambiguous: result.ambiguous.length
+      };
       renderTable();
       showExternalMatchSummary(result, mode);
     };

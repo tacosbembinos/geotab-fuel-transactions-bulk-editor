@@ -628,10 +628,138 @@
 }
 .match-dupgroup__list li { margin: 2px 0; }
 
+/* ── ZENITH SUMMARY TILES + CARD DECK ────────────────────────────────
+   Mimics Geotab Zenith's `zen-summary-tile` + `zen-card-deck` primitives
+   (the EV Charge Monitoring summary strip pattern). We extract just the
+   primitives we need rather than vendoring the full Zenith bundle:
+     - Design tokens are inlined under .addin-root (light theme only —
+       MyGeotab admin doesn't currently expose a theme toggle to add-ins)
+     - Class names are kept identical to Zenith so a future migration to
+       the real package is a no-op
+     - Rules are scoped to .addin-root so they can't leak into the host
+
+   App-specific modifiers (`ftbe-summary-card__*-tile`) follow Zenith's
+   own convention of layering app classes on top of `zen-summary-tile`
+   primitives (cf. `assets-monitor-summary-card__fullCharge-tile`).
+   ────────────────────────────────────────────────────────────────────── */
+.addin-root {
+  /* Zenith light-theme design tokens */
+  --zen-text-primary:            #1f2833;
+  --zen-text-secondary:          #4e677e;
+  --zen-text-button-disabled:    #c0ccd8;
+  --zen-backgrounds-main:        #ffffff;
+  --zen-backgrounds-content-1:   #f2f5f7;
+  --zen-borders-general:         #c0ccd8;
+  --zen-borders-form-field--active: #0078d3;
+  --zen-accents-error--main:     #ffeceb;
+  --zen-accents-error--detail:   #a01f0e;
+  --zen-accents-success--main:   #edfef2;
+  --zen-accents-success--detail: #2b6436;
+  --zen-accents-warning--main:   #fef7ed;
+  --zen-accents-warning--detail: #59480d;
+  --zen-accents-general--main:   #ebf6ff;
+  --zen-border-width-default:    1px;
+  --zen-main-font: Roboto, "Segoe UI", Segoe, "Helvetica Neue", Helvetica, sans-serif;
+}
+
+.addin-root .zen-card-deck {
+  display: flex;
+  padding: 2px 21px;
+  flex-direction: column;
+  align-items: center;
+  border-bottom: 1px solid var(--zen-borders-general);
+  background: var(--zen-backgrounds-main);
+  gap: 8px;
+  flex-shrink: 0;
+}
+.addin-root .zen-card-deck,
+.addin-root .zen-card-deck * { box-sizing: border-box; }
+.addin-root .zen-card-deck__cards {
+  display: flex; flex-direction: row; align-items: center;
+  gap: 16px; padding: 6px 3px; margin: 0;
+  list-style: none;
+}
+.addin-root .zen-card-deck__cards-container {
+  width: 100%; overflow: auto;
+  -ms-overflow-style: none; scrollbar-width: none;
+}
+.addin-root .zen-card-deck__cards-container::-webkit-scrollbar { display: none; }
+
+.addin-root .zen-summary-tile {
+  font-family: var(--zen-main-font);
+  font-size: 14px; font-style: normal; font-weight: 400;
+  letter-spacing: 0; line-height: 16px;
+  text-transform: none; text-decoration: none;
+  height: 80px; padding: 12px;
+  border-radius: 8px;
+  color: var(--zen-text-primary);
+}
+.addin-root .zen-summary-tile,
+.addin-root .zen-summary-tile * { box-sizing: border-box; }
+.addin-root .zen-summary-tile--small  { min-width: 176px; max-width: 176px; }
+.addin-root .zen-summary-tile--medium { min-width: 272px; max-width: 272px; }
+.addin-root .zen-summary-tile--default {
+  background-color: var(--zen-backgrounds-content-1);
+  fill: var(--zen-text-primary);
+  border: var(--zen-border-width-default) solid var(--zen-text-button-disabled);
+  background: var(--zen-backgrounds-main);
+}
+.addin-root .zen-summary-tile--default .zen-summary-tile__trigger { fill: var(--zen-text-secondary); }
+.addin-root .zen-summary-tile--default:hover { box-shadow: 0 2px 5px 0 rgba(0,0,0,.17); }
+.addin-root .zen-summary-tile--error   { background-color: var(--zen-accents-error--main);   fill: var(--zen-accents-error--detail);   border: var(--zen-border-width-default) solid var(--zen-accents-error--detail); }
+.addin-root .zen-summary-tile--success { background-color: var(--zen-accents-success--main); fill: var(--zen-accents-success--detail); border: var(--zen-border-width-default) solid var(--zen-accents-success--detail); }
+.addin-root .zen-summary-tile--warning { background-color: var(--zen-accents-warning--main); fill: var(--zen-accents-warning--detail); border: var(--zen-border-width-default) solid var(--zen-accents-warning--detail); }
+.addin-root .zen-summary-tile--active  { background-color: var(--zen-accents-general--main); fill: var(--zen-text-secondary);          border: var(--zen-border-width-default) solid var(--zen-borders-form-field--active); }
+.addin-root .zen-summary-tile--active:hover,
+.addin-root .zen-summary-tile--error:hover,
+.addin-root .zen-summary-tile--success:hover,
+.addin-root .zen-summary-tile--warning:hover { box-shadow: 0 4px 4px 0 rgba(0,0,0,.22); }
+
+.addin-root .zen-summary-tile--action,
+.addin-root .zen-summary-tile__clickable-area {
+  cursor: pointer; display: flex; flex-direction: column; text-align: start;
+}
+.addin-root .zen-summary-tile--action { position: relative; }
+.addin-root .zen-summary-tile__clickable-area {
+  background: 0 0; border: 0; padding: 0;
+  width: 100%; height: 100%;
+  color: inherit; fill: inherit; font: inherit;
+  border-radius: inherit;
+}
+.addin-root .zen-summary-tile__clickable-area:focus-visible { outline: 0; }
+.addin-root .zen-summary-tile--action:has(.zen-summary-tile__clickable-area:focus-visible) {
+  outline: 2px solid var(--zen-borders-form-field--active);
+  outline-offset: -1px;
+}
+.addin-root .zen-summary-tile__title-block {
+  height: 16px;
+  display: inline-flex; justify-content: space-between;
+  width: 100%; margin-bottom: 8px;
+}
+.addin-root .zen-summary-tile__content {
+  max-height: 32px; min-height: 32px; overflow-y: hidden; width: 100%;
+}
+.addin-root .zen-summary-tile__title-text { flex-grow: 1; margin-right: 4px; font-size: 12px; color: var(--zen-text-secondary); font-weight: 500; }
+.addin-root .zen-summary-tile__title-icon { flex-shrink: 0; color: var(--zen-text-secondary); }
+.addin-root .zen-summary-tile__value      { font-size: 22px; font-weight: 600; line-height: 24px; color: var(--zen-text-primary); }
+.addin-root .zen-summary-tile__unit       { font-size: 11px; color: var(--zen-text-secondary); margin-left: 6px; vertical-align: 2px; }
+
+/* App-specific deck wrapper + tile modifiers (Zenith convention). */
+.addin-root .ftbe-summary-cards { padding: 0; border-bottom: 0; background: transparent; }
+.addin-root .ftbe-summary-card__pending-tile:not([data-empty="true"])    { background-color: var(--zen-accents-warning--main); border-color: var(--zen-accents-warning--detail); }
+.addin-root .ftbe-summary-card__pending-tile:not([data-empty="true"])    .zen-summary-tile__value { color: var(--zen-accents-warning--detail); }
+.addin-root .ftbe-summary-card__unmatched-tile:not([data-empty="true"])  { background-color: var(--zen-accents-error--main);   border-color: var(--zen-accents-error--detail); }
+.addin-root .ftbe-summary-card__unmatched-tile:not([data-empty="true"])  .zen-summary-tile__value { color: var(--zen-accents-error--detail); }
+.addin-root .ftbe-summary-card__matched-tile:not([data-empty="true"])    { background-color: var(--zen-accents-success--main); border-color: var(--zen-accents-success--detail); }
+.addin-root .ftbe-summary-card__matched-tile:not([data-empty="true"])    .zen-summary-tile__value { color: var(--zen-accents-success--detail); }
+.addin-root .ftbe-summary-card__selected-tile:not([data-empty="true"])   { background-color: var(--zen-accents-general--main); border-color: var(--zen-borders-form-field--active); }
+.addin-root .ftbe-summary-card__selected-tile:not([data-empty="true"])   .zen-summary-tile__value { color: var(--zen-borders-form-field--active); }
+
 /* ── RESPONSIVE ──────────────────────────────────────────────────── */
 @media (max-width: 900px) {
   .addin-header { padding: 0 12px; }
   .addin-body   { padding: 8px; gap: 8px; }
   .addin-form-grid { grid-template-columns: 1fr; }
   .addin-field { min-width: 0; flex: 1 1 140px; }
+  .addin-root .zen-card-deck { padding: 2px 12px 1px; }
 }

@@ -26,7 +26,7 @@
        config.json#version, commit, then `git tag vX.Y.Z && git push --tags`.
        The ?v= query string is a defence-in-depth browser-cache buster; the
        immutable tag is what actually makes the CDN safe. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/styles/main.css?v=1.1.2">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.3/styles/main.css?v=1.1.3">
 </head>
 <body>
 
@@ -109,6 +109,52 @@
       </div>
     </section>
 
+    <!-- Zenith-styled summary tiles. Layout mirrors Zenith's EV Charge
+         Monitoring page: a horizontal card-deck of small summary tiles.
+         Tiles re-skin themselves (success/warning/error) when their count
+         is non-zero so the user notices at a glance. -->
+    <section class="zen-card-deck ftbe-summary-cards" aria-label="Summary">
+      <ul class="zen-card-deck__cards-container">
+        <li class="zen-card-deck__cards">
+          <div class="zen-summary-tile zen-summary-tile--default zen-summary-tile--small ftbe-summary-card__loaded-tile" id="ftbe-tile-loaded">
+            <div class="zen-summary-tile__title-block">
+              <span class="zen-summary-tile__title-text">Loaded</span>
+              <span class="zen-summary-tile__title-icon" title="Transactions returned by the current date-range filter." aria-hidden="true">ⓘ</span>
+            </div>
+            <div class="zen-summary-tile__content"><span class="zen-summary-tile__value" data-count>0</span><span class="zen-summary-tile__unit">transactions</span></div>
+          </div>
+          <div class="zen-summary-tile zen-summary-tile--default zen-summary-tile--small ftbe-summary-card__selected-tile" id="ftbe-tile-selected" data-empty="true">
+            <div class="zen-summary-tile__title-block">
+              <span class="zen-summary-tile__title-text">Selected</span>
+              <span class="zen-summary-tile__title-icon" title="Rows ticked for bulk edit or delete." aria-hidden="true">ⓘ</span>
+            </div>
+            <div class="zen-summary-tile__content"><span class="zen-summary-tile__value" data-count>0</span><span class="zen-summary-tile__unit">rows</span></div>
+          </div>
+          <div class="zen-summary-tile zen-summary-tile--default zen-summary-tile--small ftbe-summary-card__pending-tile" id="ftbe-tile-pending" data-empty="true">
+            <div class="zen-summary-tile__title-block">
+              <span class="zen-summary-tile__title-text">Pending edits</span>
+              <span class="zen-summary-tile__title-icon" title="Staged changes not yet sent to Geotab. Click Save edits to commit." aria-hidden="true">ⓘ</span>
+            </div>
+            <div class="zen-summary-tile__content"><span class="zen-summary-tile__value" data-count>0</span><span class="zen-summary-tile__unit">edits</span></div>
+          </div>
+          <div class="zen-summary-tile zen-summary-tile--default zen-summary-tile--small ftbe-summary-card__matched-tile" id="ftbe-tile-matched" data-empty="true">
+            <div class="zen-summary-tile__title-block">
+              <span class="zen-summary-tile__title-text">Matched</span>
+              <span class="zen-summary-tile__title-icon" title="CSV rows matched to existing FuelTransactions in the last import / lookup." aria-hidden="true">ⓘ</span>
+            </div>
+            <div class="zen-summary-tile__content"><span class="zen-summary-tile__value" data-count>0</span><span class="zen-summary-tile__unit">last CSV</span></div>
+          </div>
+          <div class="zen-summary-tile zen-summary-tile--default zen-summary-tile--small ftbe-summary-card__unmatched-tile" id="ftbe-tile-unmatched" data-empty="true">
+            <div class="zen-summary-tile__title-block">
+              <span class="zen-summary-tile__title-text">Unmatched</span>
+              <span class="zen-summary-tile__title-icon" title="CSV rows with no matching FuelTransaction. Use Force Import… to add them." aria-hidden="true">ⓘ</span>
+            </div>
+            <div class="zen-summary-tile__content"><span class="zen-summary-tile__value" data-count>0</span><span class="zen-summary-tile__unit">last CSV</span></div>
+          </div>
+        </li>
+      </ul>
+    </section>
+
     <section class="card card--flex" aria-label="Transactions">
       <div class="card__header">
         <span class="card__title">Transactions</span>
@@ -157,8 +203,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/scripts/csv.js?v=1.1.2"></script>
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/scripts/main.js?v=1.1.2"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.3/scripts/csv.js?v=1.1.3"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.3/scripts/main.js?v=1.1.3"></script>
 
 </body>
 </html>
