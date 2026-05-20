@@ -30,19 +30,21 @@ geotab.addin.fuelBulkEditor = function () {
   const L_PER_GAL_US    = 3.785411784;
   const KM_PER_MI       = 1.609344;
 
-  // Server limit observed in HAR: "API calls quota exceeded. Maximum admitted
-  // 200 per 1m." Sub-calls inside an ExecuteMultiCall count individually, so
-  // a naïve 56-chunk save of ~5,600 Set sub-calls trips the bucket on the
-  // 3rd chunk. We throttle proactively on a sliding window and back off
-  // reactively when OverLimitException still slips through (e.g. when other
-  // tabs in MyGeotab share the same per-user quota).
-  const RATE_LIMIT = Object.freeze({
-    callsPerWindow: 200,
-    windowMs:       60 * 1000,
-    safetyMargin:   0.9,         // effective cap ≈ 180/min
-    maxRetries:     5,
-    defaultCooldownMs: 60 * 1000 // floor when err carries no usable hint
-  });
+  // Geotab per-user API quota. The HAR capture shows this tenant is provisioned
+  // at "Maximum admitted 200 per 1m." Sub-calls inside an ExecuteMultiCall
+  // count individually, so a naïve 56-chunk save of ~5,600 Set sub-calls trips
+  // the bucket on the 3rd chunk. We throttle proactively on a sliding window,
+  // auto-calibrate from the server's own error message (some tenants run at
+  // 100/min, others higher), and back off reactively when OverLimitException
+  // still slips through (e.g. other MyGeotab tabs sharing the same quota).
+  // Kept as `let` (not frozen) so parseQuotaFromMessage() can adjust live.
+  const RATE_LIMIT = {
+    callsPerWindow:    200,
+    windowMs:          60 * 1000,
+    safetyMargin:      0.9,         // effective cap ≈ 180/min
+    maxRetries:        5,
+    defaultCooldownMs: 60 * 1000    // when err carries no usable hint
+  };
 
   const PRODUCT_TYPES = Object.freeze([
     'Unknown', 'Regular', 'Midgrade', 'Premium', 'Super',
@@ -156,21 +158,41 @@ geotab.addin.fuelBulkEditor = function () {
     ].filter(Boolean).join(' ');
     return /OverLimitException/i.test(bag) || /quota exceeded/i.test(bag);
   }
+
+  // Parse "Maximum admitted N per Wm" / "...per Ws" out of the JSON-RPC error
+  // message and adjust RATE_LIMIT live. Geotab provisions quotas per tenant;
+  // a tenant on 100/min would otherwise see this code over-throttle.
+  function parseQuotaFromMessage(err) {
+    const msg = (err && err.message) || '';
+    const m = msg.match(/Maximum admitted\s+(\d+)\s+per\s+(\d+)\s*([smh])/i);
+    if (!m) return;
+    const n = parseInt(m[1], 10);
+    const w = parseInt(m[2], 10);
+    const unit = m[3].toLowerCase();
+    const ms = (unit === 'h' ? 3600 : unit === 'm' ? 60 : 1) * 1000 * w;
+    if (n > 0 && ms > 0) {
+      RATE_LIMIT.callsPerWindow = n;
+      RATE_LIMIT.windowMs = ms;
+      RATE_LIMIT.defaultCooldownMs = ms;
+    }
+  }
+
   function parseRetryAfterMs(err) {
     // api.multiCall's error callback receives the parsed JSON-RPC error and
     // does NOT expose the HTTP Retry-After header. Best-effort: honour
     // err.retryAfter if a custom transport forwarded it; otherwise fall back
-    // to the full window (server resets the bucket on a fixed cadence).
+    // to the full window (the server resets the bucket on a fixed cadence).
     const ra = err && (err.retryAfter || (err.data && err.data.retryAfter));
     if (typeof ra === 'number' && isFinite(ra) && ra > 0) return Math.max(1000, ra * 1000);
     return RATE_LIMIT.defaultCooldownMs;
   }
 
   // Wraps api.call in a Promise + tracks a cancel handle in ui.inflight.
-  // Counts as 1 sub-call against the rate window.
-  // On cancel the Promise REJECTS with CANCELLED — never silently swallows the
-  // callback, which would orphan the Promise and leave the UI status stuck.
-  function apiCall(method, params) {
+  // Counts as 1 sub-call against the rate window. Throttles proactively,
+  // retries on OverLimitException with exponential backoff, and REJECTS with
+  // CANCELLED on blur/unload (never silently orphans the callback chain).
+  function apiCall(method, params, opts) {
+    opts = opts || {};
     if (!api || typeof api.call !== 'function') {
       return Promise.reject(new Error('API unavailable (standalone preview)'));
     }
@@ -182,35 +204,25 @@ geotab.addin.fuelBulkEditor = function () {
         (res) => resolve({ ok: true, res }),
         (err) => resolve({ ok: false, err })
       );
-    return new Promise((resolve, reject) => {
-      try {
-        api.call(method, params,
-          (res) => {
-            ui.inflight.delete(handle);
-            if (cancelled) reject(CANCELLED); else resolve(res);
-          },
-          (err) => {
-            ui.inflight.delete(handle);
-            if (cancelled) reject(CANCELLED); else reject(err);
-          });
-      } catch (e) { ui.inflight.delete(handle); reject(e); }
     });
 
     return (async () => {
       let attempt = 0;
       try {
         while (true) {
-          if (handle.aborted) throw new Error('aborted');
+          if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
           await awaitCapacity(1, handle);
+          if (handle.aborted) throw CANCELLED;
           recordSubcalls(1);
           const out = await invoke();
-          if (handle.aborted) throw new Error('aborted');
+          if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
           if (out.ok) return out.res;
           if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
+            parseQuotaFromMessage(out.err);
             const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
             setStatus('Rate limit hit. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
             await sleep(waitMs);
-            rateState.events.length = 0;   // server window has reset
+            rateState.events.length = 0;     // server window has reset
             attempt++;
             continue;
           }
@@ -222,19 +234,16 @@ geotab.addin.fuelBulkEditor = function () {
     })();
   }
 
-  // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK — BUILD_GUIDE §6 / §7.6.
-  // Validates each sub-call argument; the server aborts a whole batch on one
-  // bad shape. Throttles against RATE_LIMIT proactively and retries the
-  // current chunk on OverLimitException (atomic per-batch — requestIndex 0,
-  // no sub-calls committed, so a full re-send is safe).
-  function apiMultiCall(calls) {
-  // - Validates each sub-call (server aborts a whole batch on one bad shape).
-  // - Real cancellation: between chunks, if the handle was aborted, remaining
-  //   sub-calls are padded with { __cancelled: true } and resolve immediately.
-  //   We can't recall chunks already in flight on the server, but we stop
-  //   issuing new ones — which is what matters for blur during a bulk Save.
-  // - Progress: when chunks > 1, setStatus reports "N / total" after each
-  //   chunk so long imports/saves don't look hung.
+  // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK.
+  //   - Validates each sub-call (server aborts a whole batch on one bad shape).
+  //   - Throttles against RATE_LIMIT proactively (sliding window of sub-calls).
+  //   - Retries the current chunk on OverLimitException — atomic per-batch
+  //     (HAR shows requestIndex:0, no sub-calls committed), so re-send is safe.
+  //   - Real cancellation between chunks: remaining sub-calls are padded with
+  //     { __cancelled: true } and resolve immediately. We can't recall chunks
+  //     already in flight on the server, but we stop issuing new ones — which
+  //     is what matters for blur during a bulk Save.
+  //   - Progress: when chunks > 1, opts.label drives a "N / total" status.
   // opts: { label?: string, gen?: number }
   function apiMultiCall(calls, opts) {
     opts = opts || {};
@@ -259,34 +268,54 @@ geotab.addin.fuelBulkEditor = function () {
       );
     });
 
+    const total = valid.length;
+    const label = opts.label || null;
+    const checkAborted = () =>
+      handle.aborted || (opts.gen != null && isStale(opts.gen));
+
     return (async () => {
       const all = [];
+      let done = 0;
       try {
         for (let idx = 0; idx < chunks.length; idx++) {
-          if (handle.aborted) break;
           const chunk = chunks[idx];
+          if (checkAborted()) {
+            const rest = chunks.slice(idx).reduce((n, c) => n + c.length, 0);
+            for (let k = 0; k < rest; k++) all.push(CANCELLED);
+            return all;
+          }
           let attempt = 0;
           while (true) {
             await awaitCapacity(chunk.length, handle);
-            if (handle.aborted) return all;
+            if (checkAborted()) {
+              const rest = chunks.slice(idx).reduce((n, c) => n + c.length, 0);
+              for (let k = 0; k < rest; k++) all.push(CANCELLED);
+              return all;
+            }
             recordSubcalls(chunk.length);
-            if (chunks.length > 1) {
-              setStatus('Sending batch ' + (idx + 1) + ' / ' + chunks.length +
-                        ' (' + chunk.length + ' calls)…');
+            if (label && chunks.length > 1) {
+              setStatus(label + ' — ' + done + ' / ' + total +
+                        ' (chunk ' + (idx + 1) + ' of ' + chunks.length + ')…');
             }
             const out = await sendChunk(chunk);
-            if (out.ok) { all.push.apply(all, out.results); break; }
+            if (out.ok) {
+              all.push.apply(all, out.results);
+              done += chunk.length;
+              break;
+            }
             if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
+              parseQuotaFromMessage(out.err);
               const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
-              setStatus('Rate limit hit on batch ' + (idx + 1) + ' / ' + chunks.length +
+              setStatus('Rate limit hit on chunk ' + (idx + 1) + ' / ' + chunks.length +
                         '. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
               await sleep(waitMs);
               rateState.events.length = 0;
               attempt++;
               continue;
             }
-            // Non-rate-limit failure (or exhausted retries): record per-subcall.
-            all.push.apply(all, chunk.map(() => ({ __error: out.err })));
+            // Non-rate-limit failure (or retries exhausted): mark per-subcall.
+            for (let k = 0; k < chunk.length; k++) all.push({ __error: out.err });
+            done += chunk.length;
             break;
           }
         }
@@ -295,37 +324,6 @@ geotab.addin.fuelBulkEditor = function () {
         ui.inflight.delete(handle);
       }
     })();
-    let cancelled = false;
-    const handle = { abort() { cancelled = true; } };
-    ui.inflight.add(handle);
-    const total = valid.length;
-    const label = opts.label || null;
-    let done = 0;
-
-    return chunks.reduce((p, chunk, idx) => p.then((acc) => new Promise((resolve) => {
-      // Caller-driven cancellation (focus moved, user cancelled, unload).
-      if (cancelled || (opts.gen != null && isStale(opts.gen))) {
-        const rest = chunks.slice(idx).reduce((n, c) => n + c.length, 0);
-        resolve(acc.concat(new Array(rest).fill({ __cancelled: true })));
-        return;
-      }
-      api.multiCall(chunk,
-        (results) => {
-          done += chunk.length;
-          if (label && chunks.length > 1 && !isStale(opts.gen != null ? opts.gen : ui.opGen)) {
-            setStatus(label + ' — ' + done + ' / ' + total +
-                      ' (chunk ' + (idx + 1) + ' of ' + chunks.length + ')…');
-          }
-          resolve(acc.concat(results || []));
-        },
-        (err) => {
-          done += chunk.length;
-          resolve(acc.concat(chunk.map(() => ({ __error: err }))));
-        });
-    })), Promise.resolve([])).then((results) => {
-      ui.inflight.delete(handle);
-      return results;
-    });
   }
 
   // ── Unit + format helpers ────────────────────────────────────────────────
