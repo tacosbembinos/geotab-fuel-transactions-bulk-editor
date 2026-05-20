@@ -70,6 +70,8 @@ geotab.addin.fuelBulkEditor = function () {
     rows: [],                  // current loaded FuelTransactions (canonical/raw shape)
     edited: new Map(),         // id -> patch object (pending UI edits)
     selected: new Set(),       // selected row ids
+    unmatchedPreview: [],      // CSV rows with no FT match — shown grey at top of table; ⇒ Force Import
+    duplicateTargets: new Map(), // tx.id -> count of CSV rows that matched it (>1 = warning)
     sortKey: 'dateTime',
     sortDir: 'desc',
     deviceById: new Map(),     // deviceId -> name
@@ -408,6 +410,8 @@ geotab.addin.fuelBulkEditor = function () {
     ui.rows = [];
     ui.edited.clear();
     ui.selected.clear();
+    ui.unmatchedPreview = [];
+    ui.duplicateTargets.clear();
     renderTable();
 
     const myGen = ui.opGen;
@@ -479,43 +483,156 @@ geotab.addin.fuelBulkEditor = function () {
     return filtered;
   }
 
+  // ── Change-visualization helpers ─────────────────────────────────────────
+  // The visual vocabulary the table uses to communicate edits:
+  //   amber cell + left accent  = value differs from server (pending edit)
+  //   ↑ / ↓                     = numeric direction of change
+  //   ✎                         = non-numeric change (text/enum/datetime)
+  //   • (dot)                   = field is the SAME as server (no change staged
+  //                               for this cell, even if other cells on the row changed)
+  //   title= tooltip            = exact before → after values in raw units
+  //   grey row + dashed border  = unmatched CSV row that needs Force Import
+  //   amber row stripe          = "duplicate target" warning (≥2 CSV rows hit same FT)
+  function isCellChanged(oldVal, newVal) {
+    if (newVal == null) return false;
+    if (oldVal == null) return true;
+    if (typeof oldVal === 'number' && typeof newVal === 'number') {
+      return Math.abs(oldVal - newVal) > 1e-9;
+    }
+    return String(oldVal) !== String(newVal);
+  }
+  function diffMarker(oldVal, newVal, isNumeric) {
+    if (isNumeric && oldVal != null && newVal != null) {
+      const a = Number(oldVal), b = Number(newVal);
+      if (isFinite(a) && isFinite(b)) {
+        if (b > a) return '↑';
+        if (b < a) return '↓';
+      }
+    }
+    return '✎';
+  }
+  // Build a single cell. If `oldRaw !== newRaw`, wrap in .cell-edit with a
+  // marker + tooltip; otherwise return the plain escaped display value.
+  function diffCell(oldRaw, newRaw, displayVal, opts) {
+    opts = opts || {};
+    const displayOld = opts.displayOld != null ? opts.displayOld : oldRaw;
+    const changed = isCellChanged(oldRaw, newRaw);
+    const safeDisplay = escapeHtml(displayVal == null ? '' : String(displayVal));
+    if (!changed) return safeDisplay;
+    const marker = diffMarker(oldRaw, newRaw, !!opts.numeric);
+    const title  = 'was: ' + (oldRaw == null || oldRaw === '' ? '(empty)' : displayOld) +
+                   '  →  now: ' + (newRaw == null || newRaw === '' ? '(empty)' : (displayVal == null ? newRaw : displayVal));
+    return '<span class="cell-edit" title="' + escapeHtml(title) + '">' +
+             safeDisplay +
+             ' <span class="cell-edit__marker" aria-hidden="true">' + marker + '</span>' +
+           '</span>';
+  }
+
+  // Render the small "unmatched CSV preview" rows pinned to the top of the
+  // tbody so the user can see what would NOT be staged before they save.
+  // These rows are read-only — they have no Geotab `id` yet (that's the whole
+  // point) — so they don't participate in selection or bulk operations.
+  function unmatchedPreviewRowsHtml() {
+    if (!ui.unmatchedPreview.length) return '';
+    return ui.unmatchedPreview.map((u, idx) => {
+      const csv = u.csvRow || u;
+      const reason = u.reason || '';
+      const key = csv.vehicleIdentificationNumber || csv.serialNumber || csv.licencePlate || '(no key)';
+      const dt = csv.dateTime ? fmtDateTime(csv.dateTime) : '';
+      const vol = csv.volume != null && csv.volume !== '' ? csv.volume : '';
+      const cost = csv.cost != null && csv.cost !== '' ? csv.cost : '';
+      const odo = csv.odometer != null && csv.odometer !== '' ? csv.odometer : '';
+      const tipParts = ['No existing FuelTransaction matched this CSV row.'];
+      if (reason) tipParts.push(reason);
+      tipParts.push('To add it as a new record, re-run import with “Force Import…” or use Geotab’s native Fuel Transactions import.');
+      const tip = tipParts.join('\n');
+      return '<tr class="is-unmatched-preview" data-pending-idx="' + idx + '" title="' + escapeHtml(tip) + '">' +
+        '<td class="addin-col-check"><span class="cell-pending-badge" aria-label="Unmatched CSV row">+</span></td>' +
+        '<td>' + escapeHtml(dt) + '</td>' +
+        '<td colspan="2"><span class="cell-pending-label">UNMATCHED · ' + escapeHtml(key) + '</span></td>' +
+        '<td>' + escapeHtml(csv.productType || '') + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(vol) + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(cost) + '</td>' +
+        '<td>' + escapeHtml(csv.currencyCode || '') + '</td>' +
+        '<td class="addin-col-num">' + escapeHtml(odo) + '</td>' +
+        '<td>' + escapeHtml(csv.siteName || '') + '</td>' +
+        '<td>' + escapeHtml(csv.cardNumber || '') + '</td>' +
+        '<td><i>' + escapeHtml(reason) + '</i></td>' +
+        '<td class="addin-col-actions">' +
+          '<button type="button" class="addin-row-btn" data-action="dismiss-pending" data-pending-idx="' + idx + '">Dismiss</button>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
   function renderTable() {
     const tbody = $('ftbe-tbody');
     if (!tbody) return;
     const rows = deriveDisplayRows();
-    if (!rows.length) {
+    const unmatchedHtml = unmatchedPreviewRowsHtml();
+    if (!rows.length && !unmatchedHtml) {
       tbody.innerHTML = '<tr><td colspan="13" class="addin-empty">No transactions match.</td></tr>';
       updateBulkButtons();
       updateSortIndicators();
+      updateLegendStrip();
       return;
     }
     const html = rows.map((d) => {
       const isSel = ui.selected.has(d.id);
       const isEdited = ui.edited.has(d.id);
+      const isDupTarget = (ui.duplicateTargets.get(d.id) || 0) > 1;
       const patch = ui.edited.get(d.id) || {};
-      const vol = patch.volume != null ? patch.volume : d.volume;
-      const cost = patch.cost != null ? patch.cost : d.cost;
-      const odo = patch.odometer != null ? patch.odometer : d.odometer;
-      const cur = patch.currencyCode != null ? patch.currencyCode : d.currencyCode;
-      const prod = patch.productType != null ? patch.productType : d.productType;
-      const cmt = patch.comments != null ? patch.comments : d.comments;
-      const dt  = patch.dateTime != null ? patch.dateTime : d.dateTime;
-      return '<tr data-id="' + escapeHtml(d.id) + '"' +
-             (isSel ? ' class="is-selected"' : '') +
-             (isEdited ? ' class="is-edited"' : '') + '>' +
+
+      // Old (server) vs new (post-patch) raw values, by field.
+      const newVol = patch.volume       != null ? patch.volume       : d.volume;
+      const newCost = patch.cost        != null ? patch.cost         : d.cost;
+      const newOdo  = patch.odometer    != null ? patch.odometer     : d.odometer;
+      const newCur  = patch.currencyCode!= null ? patch.currencyCode : d.currencyCode;
+      const newProd = patch.productType != null ? patch.productType  : d.productType;
+      const newCmt  = patch.comments    != null ? patch.comments     : d.comments;
+      const newDt   = patch.dateTime    != null ? patch.dateTime     : d.dateTime;
+
+      const dtCell   = diffCell(d.dateTime, patch.dateTime != null ? newDt : null,
+                                fmtDateTime(newDt),
+                                { displayOld: fmtDateTime(d.dateTime) });
+      const prodCell = diffCell(d.productType, patch.productType != null ? newProd : null, newProd || '');
+      const volCell  = diffCell(d.volume, patch.volume != null ? newVol : null,
+                                newVol != null ? fmtNum(toDisplayVolume(newVol), 3) : '',
+                                { numeric: true,
+                                  displayOld: d.volume != null ? fmtNum(toDisplayVolume(d.volume), 3) + ' ' + ui.volUnit : '(empty)' });
+      const costCell = diffCell(d.cost, patch.cost != null ? newCost : null,
+                                newCost != null ? fmtNum(newCost, 2) : '',
+                                { numeric: true });
+      const curCell  = diffCell(d.currencyCode, patch.currencyCode != null ? newCur : null, newCur || '');
+      const odoCell  = diffCell(d.odometer, patch.odometer != null ? newOdo : null,
+                                newOdo != null ? fmtNum(toDisplayOdo(newOdo), 0) : '',
+                                { numeric: true,
+                                  displayOld: d.odometer != null ? fmtNum(toDisplayOdo(d.odometer), 0) + ' ' + ui.odoUnit : '(empty)' });
+      const cmtCell  = diffCell(d.comments, patch.comments != null ? newCmt : null, newCmt || '');
+
+      const rowClasses = ['ftbe-row'];
+      if (isSel) rowClasses.push('is-selected');
+      if (isEdited) rowClasses.push('is-edited');
+      if (isDupTarget) rowClasses.push('is-dup-target');
+
+      const dupTip = isDupTarget
+        ? ' title="Warning: ' + ui.duplicateTargets.get(d.id) + ' CSV rows matched this same FuelTransaction. Only the last set of edits will be kept."'
+        : '';
+
+      return '<tr data-id="' + escapeHtml(d.id) + '" class="' + rowClasses.join(' ') + '"' + dupTip + '>' +
         '<td class="addin-col-check"><input type="checkbox" class="ftbe-row-check" ' +
             (isSel ? 'checked' : '') + ' aria-label="Select row"></td>' +
-        '<td>' + escapeHtml(fmtDateTime(dt)) + '</td>' +
+        '<td>' + dtCell + '</td>' +
         '<td>' + escapeHtml(d.deviceName) + '</td>' +
         '<td>' + escapeHtml(d.driverName) + '</td>' +
-        '<td>' + escapeHtml(prod || '') + '</td>' +
-        '<td class="addin-col-num">' + escapeHtml(vol != null ? fmtNum(toDisplayVolume(vol), 3) : '') + '</td>' +
-        '<td class="addin-col-num">' + escapeHtml(cost != null ? fmtNum(cost, 2) : '') + '</td>' +
-        '<td>' + escapeHtml(cur || '') + '</td>' +
-        '<td class="addin-col-num">' + escapeHtml(odo != null ? fmtNum(toDisplayOdo(odo), 0) : '') + '</td>' +
+        '<td>' + prodCell + '</td>' +
+        '<td class="addin-col-num">' + volCell + '</td>' +
+        '<td class="addin-col-num">' + costCell + '</td>' +
+        '<td>' + curCell + '</td>' +
+        '<td class="addin-col-num">' + odoCell + '</td>' +
         '<td>' + escapeHtml(d.siteName) + '</td>' +
         '<td>' + escapeHtml(d.cardNumber) + '</td>' +
-        '<td>' + escapeHtml(cmt) + '</td>' +
+        '<td>' + cmtCell + '</td>' +
         '<td class="addin-col-actions">' +
           '<button type="button" class="addin-row-btn" data-action="edit">Edit</button>' +
           (isEdited ? ' <button type="button" class="addin-row-btn" data-action="revert">Revert</button>' : '') +
@@ -523,9 +640,10 @@ geotab.addin.fuelBulkEditor = function () {
         '</td>' +
       '</tr>';
     }).join('');
-    tbody.innerHTML = html;
+    tbody.innerHTML = unmatchedHtml + html;
     updateBulkButtons();
     updateSortIndicators();
+    updateLegendStrip();
     const dirtyCount = ui.edited.size;
     if (dirtyCount > 0) {
       setStatus(dirtyCount + ' pending edit(s). Click "Save edits" to commit.');
@@ -533,6 +651,60 @@ geotab.addin.fuelBulkEditor = function () {
     } else {
       removeSaveEditsButton();
     }
+  }
+
+  // ── Legend strip ────────────────────────────────────────────────────────
+  // Shown above the table whenever the table has anything non-trivial to
+  // explain (pending edits, unmatched preview rows, duplicate-target warnings).
+  // Anchored to the table wrapper so it scrolls with the toolbar, not the body.
+  function updateLegendStrip() {
+    const wrap = document.querySelector('.addin-table-wrap');
+    if (!wrap) return;
+    let strip = $('ftbe-legend');
+    const dirty = ui.edited.size;
+    const dupes = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
+    const unmatched = ui.unmatchedPreview.length;
+    const need = dirty || dupes || unmatched;
+    if (!need) { if (strip) strip.remove(); return; }
+    if (!strip) {
+      strip = document.createElement('div');
+      strip.id = 'ftbe-legend';
+      strip.className = 'addin-legend';
+      wrap.parentNode.insertBefore(strip, wrap);
+    }
+    const parts = [];
+    if (dirty) {
+      parts.push(
+        '<span class="addin-legend__group">' +
+          '<span class="addin-legend__count">' + dirty + ' pending edit' + (dirty === 1 ? '' : 's') + '</span>' +
+          '<span class="addin-legend__sample cell-edit">value <span class="cell-edit__marker">↑</span></span>' +
+          '<span class="addin-legend__hint">amber cell = changed; <b>↑</b>/<b>↓</b> direction; <b>✎</b> text/enum. Hover a cell to see the previous value.</span>' +
+        '</span>'
+      );
+    }
+    if (dupes) {
+      parts.push(
+        '<span class="addin-legend__group addin-legend__group--warn">' +
+          '<span class="addin-legend__count">' + dupes + ' duplicate target' + (dupes === 1 ? '' : 's') + '</span>' +
+          '<span class="addin-legend__hint">Multiple CSV rows matched the same FuelTransaction. Only the last patch will survive.</span>' +
+        '</span>'
+      );
+    }
+    if (unmatched) {
+      parts.push(
+        '<span class="addin-legend__group addin-legend__group--ghost">' +
+          '<span class="addin-legend__count">' + unmatched + ' unmatched CSV row' + (unmatched === 1 ? '' : 's') + '</span>' +
+          '<span class="addin-legend__hint">No existing FuelTransaction matched. Use <b>Force Import…</b> to add them as new records.</span>' +
+          '<button type="button" class="addin-row-btn" id="ftbe-legend-clear-unmatched">Clear preview</button>' +
+        '</span>'
+      );
+    }
+    strip.innerHTML = parts.join('');
+    const clearBtn = $('ftbe-legend-clear-unmatched');
+    if (clearBtn) clearBtn.addEventListener('click', () => {
+      ui.unmatchedPreview = [];
+      renderTable();
+    });
   }
 
   function updateSortIndicators() {
@@ -987,35 +1159,82 @@ geotab.addin.fuelBulkEditor = function () {
       const csvIso = csvIsoSrc ? new Date(csvIsoSrc) : null;
       if (csvIso && isNaN(csvIso)) { unmatched.push({ csvRow, reason: 'bad dateTime' }); return; }
 
+      // Returns one of:
+      //   { tx, reason, deltaMs, candidateCount, keyLabel }   — confident pick
+      //   { __amb: [...candidates], keyLabel }                — no timestamp, >1 candidate
+      //   { __outOfWindow: { nearestMs, nearestTx, keyLabel } } — same VIN/Serial/Plate
+      //     exists but none within tolerance (useful for the unmatched summary)
+      //   null                                                — no candidates at all
       const tryKey = (map, raw, label) => {
         if (!raw) return null;
         const k = String(raw).toUpperCase().trim();
         const candidates = map.get(k) || [];
         if (!candidates.length) return null;
         if (!csvIso) {
-          // No timestamp — only acceptable if exactly one candidate.
-          return candidates.length === 1 ? { tx: candidates[0], reason: label + ' (no dateTime; unique)' } : { __amb: candidates };
+          return candidates.length === 1
+            ? { tx: candidates[0], reason: label + ' (no dateTime; unique)', deltaMs: null, candidateCount: 1, keyLabel: label }
+            : { __amb: candidates, keyLabel: label };
         }
-        const inWindow = candidates.filter((tx) => {
-          if (!tx.dateTime) return false;
-          return Math.abs(new Date(tx.dateTime) - csvIso) <= toleranceMs;
-        });
-        if (!inWindow.length) return null;
-        if (inWindow.length === 1) return { tx: inWindow[0], reason: label };
-        // Prefer the closest in time.
-        inWindow.sort((a, b) => Math.abs(new Date(a.dateTime) - csvIso) - Math.abs(new Date(b.dateTime) - csvIso));
-        return { tx: inWindow[0], reason: label + ' (closest of ' + inWindow.length + ')' };
+        const withDeltas = candidates
+          .filter((tx) => tx.dateTime)
+          .map((tx) => ({ tx, dms: Math.abs(new Date(tx.dateTime) - csvIso) }))
+          .sort((a, b) => a.dms - b.dms);
+        if (!withDeltas.length) return null;
+        const inWindow = withDeltas.filter((x) => x.dms <= toleranceMs);
+        if (!inWindow.length) {
+          return { __outOfWindow: { nearestMs: withDeltas[0].dms, nearestTx: withDeltas[0].tx, keyLabel: label } };
+        }
+        if (inWindow.length === 1) {
+          return { tx: inWindow[0].tx, reason: label, deltaMs: inWindow[0].dms, candidateCount: 1, keyLabel: label };
+        }
+        return {
+          tx: inWindow[0].tx,
+          reason: label + ' (closest of ' + inWindow.length + ')',
+          deltaMs: inWindow[0].dms,
+          candidateCount: inWindow.length,
+          keyLabel: label
+        };
       };
 
-      const hit =
-        tryKey(byVin,    csvRow.vehicleIdentificationNumber, 'VIN') ||
-        tryKey(bySerial, csvRow.serialNumber,                'Serial') ||
-        tryKey(byPlate,  csvRow.licencePlate,                'Plate');
-      if (!hit) { unmatched.push({ csvRow, reason: 'no VIN/Serial/Plate match within ±' + (toleranceMs / 60000) + ' min' }); return; }
-      if (hit.__amb) { ambiguous.push({ csvRow, candidates: hit.__amb }); return; }
-      matched.push({ csvRow, tx: hit.tx, reason: hit.reason });
+      const tries = [
+        tryKey(byVin,    csvRow.vehicleIdentificationNumber, 'VIN'),
+        tryKey(bySerial, csvRow.serialNumber,                'Serial'),
+        tryKey(byPlate,  csvRow.licencePlate,                'Plate')
+      ];
+      const hit = tries.find((t) => t && t.tx);
+      if (hit) {
+        matched.push({
+          csvRow, tx: hit.tx, reason: hit.reason,
+          deltaMs: hit.deltaMs, candidateCount: hit.candidateCount, keyLabel: hit.keyLabel
+        });
+        return;
+      }
+      const amb = tries.find((t) => t && t.__amb);
+      if (amb) { ambiguous.push({ csvRow, candidates: amb.__amb, keyLabel: amb.keyLabel }); return; }
+      const oow = tries.find((t) => t && t.__outOfWindow);
+      const reason = oow
+        ? 'nearest ' + oow.__outOfWindow.keyLabel + ' match was ' + fmtDeltaMs(oow.__outOfWindow.nearestMs) + ' away (outside ±' + (toleranceMs / 60000) + ' min)'
+        : 'no VIN/Serial/Plate found in loaded window';
+      unmatched.push({
+        csvRow, reason,
+        nearestMissMs: oow ? oow.__outOfWindow.nearestMs : null,
+        nearestMissKey: oow ? oow.__outOfWindow.keyLabel : null
+      });
     });
     return { matched, unmatched, ambiguous };
+  }
+
+  // Humanise a millisecond delta for the match summary ("42s", "3m 12s", "2h 5m", "4d").
+  function fmtDeltaMs(ms) {
+    if (ms == null || !isFinite(ms)) return '?';
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + 's';
+    const m = Math.round(s / 60);
+    if (m < 60) return (s % 60) ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : m + 'm';
+    const h = Math.floor(m / 60);
+    if (h < 24) return (m % 60) ? h + 'h ' + (m % 60) + 'm' : h + 'h';
+    const d = Math.floor(h / 24);
+    return (h % 24) ? d + 'd ' + (h % 24) + 'h' : d + 'd';
   }
 
   function applyImport(parsed, mode) {
@@ -1206,25 +1425,47 @@ geotab.addin.fuelBulkEditor = function () {
     const finishMatch = () => {
       const result = matchExternalRows(externals, ui.rows);
       ui.selected.clear();
-      result.matched.forEach(({ csvRow, tx }) => {
-        if (mode === 'stage-edits') {
-          const patch = sanitizePatch({
-            dateTime:     csvRow.dateTime,
-            productType:  csvRow.productType,
-            volume:       csvRow.volume,
-            cost:         csvRow.cost,
-            currencyCode: csvRow.currencyCode,
-            odometer:     csvRow.odometer,
-            comments:     csvRow.comments
-          });
-          for (const k of Object.keys(patch)) { if (tx[k] === patch[k]) delete patch[k]; }
-          if (Object.keys(patch).length) {
-            const existing = ui.edited.get(tx.id) || {};
-            ui.edited.set(tx.id, Object.assign({}, existing, patch));
-          }
+      ui.duplicateTargets.clear();
+      // Track how many CSV rows landed on the same tx — flagged in the table
+      // (amber row stripe) AND surfaced as a dedicated warning section in the
+      // summary modal, because "last write wins" is silently destructive.
+      result.matched.forEach(({ tx }) => {
+        ui.duplicateTargets.set(tx.id, (ui.duplicateTargets.get(tx.id) || 0) + 1);
+      });
+      // Compute per-row "fields that will actually change" for the summary
+      // badges. We attach to the match record so showExternalMatchSummary
+      // doesn't re-walk the data.
+      result.matched.forEach((m) => {
+        const csvRow = m.csvRow, tx = m.tx;
+        const candidate = sanitizePatch({
+          dateTime:     csvRow.dateTime,
+          productType:  csvRow.productType,
+          volume:       csvRow.volume,
+          cost:         csvRow.cost,
+          currencyCode: csvRow.currencyCode,
+          odometer:     csvRow.odometer,
+          comments:     csvRow.comments
+        });
+        const changes = [];
+        for (const k of Object.keys(candidate)) {
+          if (!isCellChanged(tx[k], candidate[k])) continue;
+          changes.push({ field: k, oldVal: tx[k], newVal: candidate[k] });
+        }
+        m.changes = changes;
+      });
+      result.matched.forEach(({ csvRow, tx, changes }) => {
+        if (mode === 'stage-edits' && changes && changes.length) {
+          const patch = {};
+          changes.forEach((c) => { patch[c.field] = c.newVal; });
+          const existing = ui.edited.get(tx.id) || {};
+          ui.edited.set(tx.id, Object.assign({}, existing, patch));
         }
         ui.selected.add(tx.id);   // both modes select; match-only stops here
       });
+      // Stash unmatched rows so the table can preview them in grey above the
+      // real data — answers "what is the CSV trying to add that I'm missing?"
+      // without forcing the user back to the modal.
+      ui.unmatchedPreview = result.unmatched.slice();
       renderTable();
       showExternalMatchSummary(result, mode);
     };
@@ -1287,37 +1528,190 @@ geotab.addin.fuelBulkEditor = function () {
     }
   }
 
+  // Compact, human-first match summary.
+  //
+  // The previous version dumped opaque Geotab IDs and labels like
+  // "VIN (closest of 7)" with no field-level diff and no duplicate-target
+  // warning. This version is organised as:
+  //   1. Headline counts (legend, not just numbers)
+  //   2. Duplicate-target warnings — most destructive footgun, surfaced first
+  //   3. Matches — each row shows the VIN + CSV timestamp the user can
+  //      recognise, a match-quality chip, and a per-field change list
+  //   4. Unmatched — grouped block with a hint pointing to Force Import
+  //   5. Ambiguous — needs CSV dateTime to disambiguate
   function showExternalMatchSummary(result, mode) {
     $('ftbe-modal-title').textContent = (mode === 'match-only') ? 'CSV lookup summary' : 'CSV match summary';
     const body = $('ftbe-modal-body');
-    const reasonsHtml = result.matched.slice(0, 25).map((m) =>
-      '<li><code>' + escapeHtml(m.tx.id) + '</code> ← ' +
-        escapeHtml(m.csvRow.vehicleIdentificationNumber || m.csvRow.serialNumber || m.csvRow.licencePlate || '(no key)') +
-        ' <span style="color:var(--geo-grey-600)">[' + escapeHtml(m.reason) + ']</span></li>'
+    // Widen the modal panel for this view — the row format wants more room.
+    const panel = document.querySelector('#ftbe-modal .addin-modal__panel');
+    if (panel) panel.classList.add('addin-modal__panel--wide');
+
+    // ── Group matches by target tx.id to detect duplicate targets ──────────
+    const targets = new Map();
+    result.matched.forEach((m) => {
+      if (!targets.has(m.tx.id)) targets.set(m.tx.id, []);
+      targets.get(m.tx.id).push(m);
+    });
+    const dupGroups = Array.from(targets.values()).filter((g) => g.length > 1);
+
+    // ── Field abbreviations + value formatters for the change badge ────────
+    const FIELD_LABELS = {
+      dateTime: 'date', productType: 'product', volume: 'vol', cost: 'cost',
+      currencyCode: 'cur', odometer: 'odo', comments: 'cmt'
+    };
+    function fmtFieldValue(field, v) {
+      if (v == null || v === '') return '(empty)';
+      if (field === 'volume')   return fmtNum(toDisplayVolume(Number(v)), 3) + ' ' + ui.volUnit;
+      if (field === 'odometer') return fmtNum(toDisplayOdo(Number(v)), 0)    + ' ' + ui.odoUnit;
+      if (field === 'cost')     return fmtNum(Number(v), 2);
+      if (field === 'dateTime') return fmtDateTime(v);
+      if (field === 'comments') return String(v).length > 40 ? String(v).slice(0, 40) + '…' : String(v);
+      return String(v);
+    }
+    function changesBadge(changes) {
+      if (!changes || !changes.length) return '<span class="match-badge match-badge--noop" title="CSV values match the existing record — nothing to stage">no change</span>';
+      const tipLines = changes.map((c) =>
+        FIELD_LABELS[c.field] + ': ' + fmtFieldValue(c.field, c.oldVal) + '  →  ' + fmtFieldValue(c.field, c.newVal)
+      );
+      const fieldList = changes.map((c) => FIELD_LABELS[c.field]).join(', ');
+      return '<span class="match-badge match-badge--change" title="' + escapeHtml(tipLines.join('\n')) + '">' +
+                changes.length + ' change' + (changes.length === 1 ? '' : 's') + ': ' + escapeHtml(fieldList) +
+             '</span>';
+    }
+    function csvKey(csv) {
+      return csv.vehicleIdentificationNumber || csv.serialNumber || csv.licencePlate || '(no key)';
+    }
+    function csvTime(csv) {
+      return csv.dateTime ? fmtDateTime(csv.dateTime) : '(no time)';
+    }
+    function matchChip(m) {
+      const label = m.keyLabel || 'match';
+      const delta = (m.deltaMs != null) ? ' · Δ ' + fmtDeltaMs(m.deltaMs) : '';
+      const fanout = (m.candidateCount && m.candidateCount > 1)
+        ? ' · 1 of ' + m.candidateCount + ' in window'
+        : '';
+      const tip = label + ' key matched' + delta + fanout;
+      return '<span class="match-chip" title="' + escapeHtml(tip) + '">' +
+        escapeHtml(label) + escapeHtml(delta) + escapeHtml(fanout) + '</span>';
+    }
+
+    // ── Headline ───────────────────────────────────────────────────────────
+    const totalChanges = result.matched.reduce((n, m) => n + ((m.changes && m.changes.length) || 0), 0);
+    const headerText = (mode === 'match-only')
+      ? 'Matched rows are <b>selected</b>. No edits were staged and nothing was sent to Geotab.'
+      : 'Matched rows are now <b>selected and staged with edits</b>. Click <b>Save edits</b> ' +
+        'to commit via the Geotab-assigned <code>id</code> + <code>version</code>.';
+
+    // ── Section: duplicate-target warnings ────────────────────────────────
+    const MAX_DUP_GROUPS = 15;
+    const dupHtml = dupGroups.slice(0, MAX_DUP_GROUPS).map((group) => {
+      const tx = group[0].tx;
+      const head = escapeHtml(group.length + ' CSV rows → same FuelTransaction (VIN ' +
+                              (tx.vehicleIdentificationNumber || tx.serialNumber || tx.licencePlate || '?') + ')');
+      const items = group.map((m) =>
+        '<li>' + escapeHtml(csvTime(m.csvRow)) + ' · ' + escapeHtml(csvKey(m.csvRow)) +
+          ' — ' + (m.changes && m.changes.length
+            ? escapeHtml(m.changes.length + ' change(s)')
+            : '<i>no change</i>') +
+        '</li>'
+      ).join('');
+      return '<div class="match-dupgroup">' +
+        '<div class="match-dupgroup__head">' + head + ' — <b>only the last set of edits will survive.</b></div>' +
+        '<ul class="match-dupgroup__list">' + items + '</ul>' +
+      '</div>';
+    }).join('');
+    const dupOverflow = dupGroups.length > MAX_DUP_GROUPS
+      ? '<p class="addin-import-summary"><i>… and ' + (dupGroups.length - MAX_DUP_GROUPS) + ' more duplicate group(s) not shown.</i></p>'
+      : '';
+
+    // ── Section: matches ─────────────────────────────────────────────────
+    const MAX_ROWS = 50;
+    const matchedRows = result.matched.slice(0, MAX_ROWS).map((m) =>
+      '<li class="match-row">' +
+        '<span class="match-row__key">' +
+          '<span class="match-row__vin">' + escapeHtml(csvKey(m.csvRow)) + '</span>' +
+          '<span class="match-row__time">' + escapeHtml(csvTime(m.csvRow)) + '</span>' +
+        '</span>' +
+        '<span class="match-row__meta">' +
+          matchChip(m) +
+          (mode === 'stage-edits' ? ' ' + changesBadge(m.changes) : '') +
+        '</span>' +
+      '</li>'
     ).join('');
-    const unmatchedHtml = result.unmatched.slice(0, 25).map((u) =>
-      '<li class="addin-import-error">' +
-        escapeHtml(u.csvRow.vehicleIdentificationNumber || u.csvRow.serialNumber || u.csvRow.licencePlate || '(no key)') +
-        ' — ' + escapeHtml(u.reason) + '</li>'
+    const matchedOverflow = result.matched.length > MAX_ROWS
+      ? '<p class="addin-import-summary"><i>… and ' + (result.matched.length - MAX_ROWS) + ' more match(es) not shown — they are selected in the table.</i></p>'
+      : '';
+
+    // ── Section: unmatched ───────────────────────────────────────────────
+    const unmatchedRows = result.unmatched.slice(0, MAX_ROWS).map((u) =>
+      '<li class="match-row match-row--unmatched">' +
+        '<span class="match-row__key">' +
+          '<span class="match-row__vin">' + escapeHtml(csvKey(u.csvRow)) + '</span>' +
+          '<span class="match-row__time">' + escapeHtml(csvTime(u.csvRow)) + '</span>' +
+        '</span>' +
+        '<span class="match-row__meta"><i>' + escapeHtml(u.reason) + '</i></span>' +
+      '</li>'
     ).join('');
-    const ambHtml = result.ambiguous.slice(0, 10).map((a) =>
-      '<li>' + escapeHtml(a.csvRow.vehicleIdentificationNumber || a.csvRow.serialNumber || a.csvRow.licencePlate || '') +
-        ' — ' + a.candidates.length + ' candidates (need dateTime to disambiguate)</li>'
+    const unmatchedOverflow = result.unmatched.length > MAX_ROWS
+      ? '<p class="addin-import-summary"><i>… and ' + (result.unmatched.length - MAX_ROWS) + ' more unmatched row(s) not shown — preview them in the table.</i></p>'
+      : '';
+
+    // ── Section: ambiguous ───────────────────────────────────────────────
+    const ambHtml = result.ambiguous.slice(0, 20).map((a) =>
+      '<li>' + escapeHtml(csvKey(a.csvRow)) +
+        ' — ' + a.candidates.length + ' candidates (need CSV dateTime to disambiguate)</li>'
     ).join('');
 
     body.innerHTML =
-      '<p class="addin-import-summary"><b>' + result.matched.length + '</b> matched, ' +
-        '<b>' + result.unmatched.length + '</b> unmatched, ' +
-        '<b>' + result.ambiguous.length + '</b> ambiguous.</p>' +
-      (mode === 'match-only'
-        ? '<p>Matched rows are selected. <b>No edits were staged and nothing was sent to Geotab.</b> ' +
-          'Use the row Edit buttons, <b>Bulk edit selected</b>, or <b>Delete selected</b> to act on them.</p>'
-        : '<p>Matched rows are now selected and staged with edits from the CSV. Click <b>Save edits</b> ' +
-          'to commit via the Geotab-assigned <code>id</code> + <code>version</code>, or ' +
-          '<b>Delete selected</b> to remove them.</p>') +
-      (reasonsHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Matches</h3><ul class="addin-import-summary">' + reasonsHtml + '</ul>' : '') +
-      (unmatchedHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Unmatched</h3><ul class="addin-import-summary">' + unmatchedHtml + '</ul>' : '') +
-      (ambHtml ? '<h3 style="font-size:13px;margin:10px 0 4px">Ambiguous</h3><ul class="addin-import-summary">' + ambHtml + '</ul>' : '');
+      // Headline
+      '<div class="match-headline">' +
+        '<div class="match-counts">' +
+          '<span class="match-count match-count--ok">'   + result.matched.length   + ' matched</span>' +
+          '<span class="match-count match-count--warn">' + dupGroups.length        + ' duplicate target' + (dupGroups.length === 1 ? '' : 's') + '</span>' +
+          '<span class="match-count match-count--miss">' + result.unmatched.length + ' unmatched</span>' +
+          '<span class="match-count match-count--amb">'  + result.ambiguous.length + ' ambiguous</span>' +
+          (mode === 'stage-edits'
+            ? '<span class="match-count match-count--diff">' + totalChanges + ' field change' + (totalChanges === 1 ? '' : 's') + ' staged</span>'
+            : '') +
+        '</div>' +
+        '<p>' + headerText + '</p>' +
+      '</div>' +
+      // Duplicate-target warnings
+      (dupGroups.length
+        ? '<section class="match-section match-section--warn">' +
+            '<h3>⚠ Duplicate targets — ' + dupGroups.length + '</h3>' +
+            '<p class="match-section__hint">When multiple CSV rows match the same FuelTransaction, ' +
+              'only the <b>last</b> patch survives. Re-check your CSV for duplicate VIN+timestamp rows.</p>' +
+            dupHtml + dupOverflow +
+          '</section>'
+        : '') +
+      // Matches
+      (matchedRows
+        ? '<section class="match-section">' +
+            '<h3>Matches — ' + result.matched.length + '</h3>' +
+            '<ul class="match-list">' + matchedRows + '</ul>' +
+            matchedOverflow +
+          '</section>'
+        : '') +
+      // Unmatched
+      (unmatchedRows
+        ? '<section class="match-section match-section--ghost">' +
+            '<h3>Unmatched — ' + result.unmatched.length + '</h3>' +
+            '<p class="match-section__hint">No existing FuelTransaction matched these CSV rows within the ±5&nbsp;min tolerance. ' +
+              'To add them as <b>new</b> records, re-run with <b>Force Import…</b> ' +
+              '(or use Geotab’s native Fuel Transactions Import). ' +
+              'These rows are previewed in grey at the top of the table.</p>' +
+            '<ul class="match-list">' + unmatchedRows + '</ul>' +
+            unmatchedOverflow +
+          '</section>'
+        : '') +
+      // Ambiguous
+      (ambHtml
+        ? '<section class="match-section">' +
+            '<h3>Ambiguous — ' + result.ambiguous.length + '</h3>' +
+            '<ul class="match-list">' + ambHtml + '</ul>' +
+          '</section>'
+        : '');
     showModal(null, true);
   }
 
@@ -1348,6 +1742,10 @@ geotab.addin.fuelBulkEditor = function () {
     modal.hidden = true;
     modal.setAttribute('inert', '');
     modal.setAttribute('aria-hidden', 'true');
+    // Reset wide-modal class so the next modal (edit/bulk/force) opens at
+    // standard width. Only the CSV match summary opts into the wide layout.
+    const panel = modal.querySelector('.addin-modal__panel');
+    if (panel) panel.classList.remove('addin-modal__panel--wide');
     const saveBtn = $('ftbe-modal-save');
     if (saveBtn) saveBtn.onclick = null;
     if (ui.lastFocusEl && typeof ui.lastFocusEl.focus === 'function') {
@@ -1417,6 +1815,17 @@ geotab.addin.fuelBulkEditor = function () {
 
     // Delegated tbody handler — survives re-renders.
     $('ftbe-tbody').addEventListener('click', (e) => {
+      // Unmatched-CSV preview rows: only support "Dismiss" (they have no id).
+      const pendingTr = e.target.closest('tr.is-unmatched-preview');
+      if (pendingTr && e.target.matches('button[data-action="dismiss-pending"]')) {
+        const idx = Number(e.target.getAttribute('data-pending-idx'));
+        if (isFinite(idx)) {
+          ui.unmatchedPreview.splice(idx, 1);
+          renderTable();
+        }
+        return;
+      }
+      if (pendingTr) return;   // ignore other clicks inside ghost rows
       const tr = e.target.closest('tr[data-id]');
       if (!tr) return;
       const id = tr.getAttribute('data-id');

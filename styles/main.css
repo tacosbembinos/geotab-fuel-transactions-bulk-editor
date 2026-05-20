@@ -292,6 +292,74 @@
   background: var(--geo-edited);
   box-shadow: inset 3px 0 0 var(--geo-amber);
 }
+
+/* ── Cell-level edit highlight (Layer A) ──────────────────────────────
+   Wraps the changed value inline so the user can see WHICH field on a
+   row is changing, with the previous value available via title=. */
+.addin-table tbody td .cell-edit {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 6px;
+  margin: -1px -2px;
+  background: #FFE9B3;
+  border-left: 2px solid var(--geo-amber);
+  border-radius: 3px;
+  font-weight: 600;
+  color: var(--geo-grey-900);
+  cursor: help;
+}
+.addin-table tbody td .cell-edit__marker {
+  font-size: 10px;
+  color: var(--geo-amber);
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* ── Duplicate-target warning stripe ─────────────────────────────────
+   Multiple CSV rows landed on this same FuelTransaction — only the last
+   patch will survive. Red left bar + title= explanation. */
+.addin-table tbody tr.is-dup-target td {
+  box-shadow: inset 3px 0 0 var(--geo-red);
+}
+.addin-table tbody tr.is-dup-target.is-selected.is-edited td {
+  box-shadow: inset 3px 0 0 var(--geo-red);
+}
+
+/* ── Unmatched-CSV preview row (ghost row) ───────────────────────────
+   Pinned to the top of tbody. Grey, dashed, no checkbox — these aren't
+   real FuelTransactions yet; user must re-run with Force Import. */
+.addin-table tbody tr.is-unmatched-preview td {
+  background: var(--geo-grey-100);
+  color: var(--geo-grey-600);
+  border-bottom: 1px dashed var(--geo-grey-300);
+  font-style: italic;
+}
+.addin-table tbody tr.is-unmatched-preview:hover td {
+  background: var(--geo-grey-200);
+}
+.addin-table tbody td .cell-pending-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--geo-grey-400);
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  font-style: normal;
+}
+.addin-table tbody td .cell-pending-label {
+  display: inline-block;
+  padding: 1px 6px;
+  background: #fff;
+  border: 1px dashed var(--geo-grey-400);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: .3px;
+  color: var(--geo-grey-600);
+}
 .addin-col-num     { text-align: right; font-variant-numeric: tabular-nums; }
 .addin-col-check,
 .addin-col-actions { width: 1%; }
@@ -409,6 +477,156 @@
   border-radius: 3px;
 }
 .addin-import-error { color: var(--geo-red); }
+
+/* ── Legend strip (Layer C) ──────────────────────────────────────────
+   Persistent affordance above the table whenever there's something
+   non-trivial to explain (pending edits, duplicate targets, ghost rows).
+   Removes the "what do these symbols mean?" question entirely. */
+.addin-legend {
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
+  align-items: center;
+  padding: 8px 14px;
+  margin: 0;
+  background: #FFFBEC;
+  border-bottom: 1px solid var(--geo-grey-200);
+  font-size: 11px;
+  color: var(--geo-grey-600);
+  flex-shrink: 0;
+}
+.addin-legend__group {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 2px 8px;
+  background: #fff;
+  border: 1px solid var(--geo-grey-200);
+  border-radius: 999px;
+  line-height: 1.4;
+}
+.addin-legend__group--warn  { border-color: rgba(198,40,40,.4); background: rgba(198,40,40,.06); }
+.addin-legend__group--ghost { border-color: var(--geo-grey-300); background: var(--geo-grey-100); }
+.addin-legend__count {
+  font-weight: 700;
+  color: var(--geo-grey-900);
+  font-variant-numeric: tabular-nums;
+}
+.addin-legend__sample {
+  font-style: normal;
+}
+.addin-legend__hint { color: var(--geo-grey-600); }
+.addin-legend__hint b { color: var(--geo-grey-900); }
+
+/* ── Match summary modal (Layer B) ─────────────────────────────────── */
+.match-headline { margin-bottom: 12px; }
+.match-headline p { margin-top: 8px; font-size: 12px; color: var(--geo-grey-600); }
+.match-counts {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.match-count {
+  display: inline-flex; align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  font-variant-numeric: tabular-nums;
+}
+.match-count--ok   { background: rgba(46,125,50,.08);  color: var(--geo-green); border-color: rgba(46,125,50,.30); }
+.match-count--warn { background: rgba(198,40,40,.08);  color: var(--geo-red);   border-color: rgba(198,40,40,.30); }
+.match-count--miss { background: var(--geo-grey-100);  color: var(--geo-grey-600); border-color: var(--geo-grey-300); }
+.match-count--amb  { background: #FFF3E0;              color: var(--geo-amber); border-color: rgba(230,81,0,.30); }
+.match-count--diff { background: var(--geo-blue-lt);   color: var(--geo-blue);  border-color: rgba(0,113,206,.30); }
+
+.match-section { margin: 14px 0; }
+.match-section h3 {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--geo-grey-900);
+  text-transform: uppercase; letter-spacing: .3px;
+  margin: 0 0 6px;
+}
+.match-section__hint {
+  font-size: 11px;
+  color: var(--geo-grey-600);
+  margin-bottom: 8px;
+}
+.match-section--warn h3  { color: var(--geo-red); }
+.match-section--ghost h3 { color: var(--geo-grey-600); }
+
+.match-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--geo-grey-200);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.match-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--geo-grey-200);
+  font-size: 12px;
+}
+.match-row:last-child { border-bottom: none; }
+.match-row:nth-child(even) { background: var(--geo-grey-100); }
+.match-row__key {
+  display: flex; flex-direction: column;
+  min-width: 220px;
+  flex-shrink: 0;
+}
+.match-row__vin  {
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--geo-grey-900);
+}
+.match-row__time { font-size: 11px; color: var(--geo-grey-600); }
+.match-row__meta { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+.match-row--unmatched { background: var(--geo-grey-100); }
+.match-row--unmatched .match-row__meta { color: var(--geo-red); }
+
+.match-chip {
+  display: inline-flex;
+  padding: 2px 8px;
+  background: var(--geo-blue-lt);
+  color: var(--geo-blue);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: help;
+}
+.match-badge {
+  display: inline-flex;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: help;
+}
+.match-badge--change { background: var(--geo-edited);     color: var(--geo-amber);     border: 1px solid rgba(230,81,0,.30); }
+.match-badge--noop   { background: var(--geo-grey-100);   color: var(--geo-grey-400);  border: 1px solid var(--geo-grey-200); }
+
+.match-dupgroup {
+  border: 1px solid rgba(198,40,40,.30);
+  background: rgba(198,40,40,.04);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.match-dupgroup__head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--geo-red);
+  margin-bottom: 4px;
+}
+.match-dupgroup__list {
+  list-style: disc;
+  padding-left: 22px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--geo-grey-600);
+}
+.match-dupgroup__list li { margin: 2px 0; }
 
 /* ── RESPONSIVE ──────────────────────────────────────────────────── */
 @media (max-width: 900px) {
