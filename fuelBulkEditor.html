@@ -20,9 +20,13 @@
   <title>Fuel Transactions Bulk Editor</title>
   <!-- Assets pinned to jsDelivr so they resolve correctly in both iframe mode
        (document origin = jsDelivr) and inline-into-<main> mode (document
-       origin = my.geotab.com). Bump the @main tag to a release tag when
-       cutting versions so customers aren't pinned to a moving HEAD. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/styles/main.css?v=1.1.1">
+       origin = my.geotab.com). Pinned to an immutable git tag (NOT @main) so
+       jsDelivr's edge cache can't serve stale post-merge content. To cut a
+       release: bump the tag in all three asset URLs below AND in
+       config.json#version, commit, then `git tag vX.Y.Z && git push --tags`.
+       The ?v= query string is a defence-in-depth browser-cache buster; the
+       immutable tag is what actually makes the CDN safe. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/styles/main.css?v=1.1.2">
 </head>
 <body>
 
@@ -153,8 +157,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/csv.js?v=1.1.1"></script>
-<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@main/scripts/main.js?v=1.1.1"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/scripts/csv.js?v=1.1.2"></script>
+<script src="https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.1.2/scripts/main.js?v=1.1.2"></script>
 
 </body>
 </html>
