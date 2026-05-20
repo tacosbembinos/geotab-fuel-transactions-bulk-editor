@@ -30,6 +30,20 @@ geotab.addin.fuelBulkEditor = function () {
   const L_PER_GAL_US    = 3.785411784;
   const KM_PER_MI       = 1.609344;
 
+  // Server limit observed in HAR: "API calls quota exceeded. Maximum admitted
+  // 200 per 1m." Sub-calls inside an ExecuteMultiCall count individually, so
+  // a naïve 56-chunk save of ~5,600 Set sub-calls trips the bucket on the
+  // 3rd chunk. We throttle proactively on a sliding window and back off
+  // reactively when OverLimitException still slips through (e.g. when other
+  // tabs in MyGeotab share the same per-user quota).
+  const RATE_LIMIT = Object.freeze({
+    callsPerWindow: 200,
+    windowMs:       60 * 1000,
+    safetyMargin:   0.9,         // effective cap ≈ 180/min
+    maxRetries:     5,
+    defaultCooldownMs: 60 * 1000 // floor when err carries no usable hint
+  });
+
   const PRODUCT_TYPES = Object.freeze([
     'Unknown', 'Regular', 'Midgrade', 'Premium', 'Super',
     'Diesel', 'DieselExhaustFluid', 'E85', 'CNG', 'LPG',
@@ -79,25 +93,110 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── API plumbing ─────────────────────────────────────────────────────────
+  // Sliding-window subcall ledger. Each entry { t, n } records how many
+  // sub-calls were emitted at time t. We prune entries older than windowMs.
+  const rateState = { events: [] };
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+  function pruneRateEvents(now) {
+    const cutoff = now - RATE_LIMIT.windowMs;
+    while (rateState.events.length && rateState.events[0].t < cutoff) rateState.events.shift();
+  }
+  function subcallsInWindow(now) {
+    pruneRateEvents(now);
+    let sum = 0;
+    for (const e of rateState.events) sum += e.n;
+    return sum;
+  }
+  function recordSubcalls(n) { rateState.events.push({ t: Date.now(), n }); }
+
+  async function awaitCapacity(n, abortHandle) {
+    const cap = Math.floor(RATE_LIMIT.callsPerWindow * RATE_LIMIT.safetyMargin);
+    // If a single chunk is larger than the cap (shouldn't happen — chunk≤100,
+    // cap=180), drain the whole window first.
+    while (!(abortHandle && abortHandle.aborted)) {
+      const now = Date.now();
+      const used = subcallsInWindow(now);
+      if (used + n <= cap) return;
+      // Walk events oldest-first until enough will have aged out to fit.
+      const need = used + n - cap;
+      let freed = 0, waitUntil = now;
+      for (const e of rateState.events) {
+        freed += e.n;
+        waitUntil = e.t + RATE_LIMIT.windowMs;
+        if (freed >= need) break;
+      }
+      const waitMs = Math.max(250, waitUntil - now + 50);
+      setStatus('Rate-limit throttle: waiting ' + Math.ceil(waitMs / 1000) + 's before next batch…');
+      await sleep(waitMs);
+    }
+  }
+
+  function isOverLimitError(err) {
+    if (!err) return false;
+    const bag = [
+      err.name, err.message, err.type,
+      err.data && err.data.type,
+      err.data && err.data.name
+    ].filter(Boolean).join(' ');
+    return /OverLimitException/i.test(bag) || /quota exceeded/i.test(bag);
+  }
+  function parseRetryAfterMs(err) {
+    // api.multiCall's error callback receives the parsed JSON-RPC error and
+    // does NOT expose the HTTP Retry-After header. Best-effort: honour
+    // err.retryAfter if a custom transport forwarded it; otherwise fall back
+    // to the full window (server resets the bucket on a fixed cadence).
+    const ra = err && (err.retryAfter || (err.data && err.data.retryAfter));
+    if (typeof ra === 'number' && isFinite(ra) && ra > 0) return Math.max(1000, ra * 1000);
+    return RATE_LIMIT.defaultCooldownMs;
+  }
+
   // Wraps api.call in a Promise + tracks a cancel handle in ui.inflight.
+  // Counts as 1 sub-call against the rate window.
   function apiCall(method, params) {
     if (!api || typeof api.call !== 'function') {
       return Promise.reject(new Error('API unavailable (standalone preview)'));
     }
-    let cancelled = false;
-    const handle = { abort() { cancelled = true; } };
+    const handle = { aborted: false, abort() { this.aborted = true; } };
     ui.inflight.add(handle);
-    return new Promise((resolve, reject) => {
-      try {
-        api.call(method, params,
-          (res) => { ui.inflight.delete(handle); if (!cancelled) resolve(res); },
-          (err) => { ui.inflight.delete(handle); if (!cancelled) reject(err); });
-      } catch (e) { ui.inflight.delete(handle); reject(e); }
+
+    const invoke = () => new Promise((resolve) => {
+      api.call(method, params,
+        (res) => resolve({ ok: true, res }),
+        (err) => resolve({ ok: false, err })
+      );
     });
+
+    return (async () => {
+      let attempt = 0;
+      try {
+        while (true) {
+          if (handle.aborted) throw new Error('aborted');
+          await awaitCapacity(1, handle);
+          recordSubcalls(1);
+          const out = await invoke();
+          if (handle.aborted) throw new Error('aborted');
+          if (out.ok) return out.res;
+          if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
+            const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
+            setStatus('Rate limit hit. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
+            await sleep(waitMs);
+            rateState.events.length = 0;   // server window has reset
+            attempt++;
+            continue;
+          }
+          throw out.err;
+        }
+      } finally {
+        ui.inflight.delete(handle);
+      }
+    })();
   }
 
   // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK — BUILD_GUIDE §6 / §7.6.
-  // Validates each sub-call argument; the server aborts a whole batch on one bad shape.
+  // Validates each sub-call argument; the server aborts a whole batch on one
+  // bad shape. Throttles against RATE_LIMIT proactively and retries the
+  // current chunk on OverLimitException (atomic per-batch — requestIndex 0,
+  // no sub-calls committed, so a full re-send is safe).
   function apiMultiCall(calls) {
     if (!api || typeof api.multiCall !== 'function') {
       return Promise.reject(new Error('multiCall unavailable'));
@@ -110,14 +209,52 @@ geotab.addin.fuelBulkEditor = function () {
     for (let i = 0; i < valid.length; i += MULTICALL_CHUNK) {
       chunks.push(valid.slice(i, i + MULTICALL_CHUNK));
     }
-    return chunks.reduce((p, chunk) => p.then((acc) => new Promise((resolve) => {
-      const handle = { abort() {} };
-      ui.inflight.add(handle);
+    const handle = { aborted: false, abort() { this.aborted = true; } };
+    ui.inflight.add(handle);
+
+    const sendChunk = (chunk) => new Promise((resolve) => {
       api.multiCall(chunk,
-        (results) => { ui.inflight.delete(handle); resolve(acc.concat(results || [])); },
-        (err)     => { ui.inflight.delete(handle); resolve(acc.concat(chunk.map(() => ({ __error: err })))); }
+        (results) => resolve({ ok: true, results: results || [] }),
+        (err)     => resolve({ ok: false, err })
       );
-    })), Promise.resolve([]));
+    });
+
+    return (async () => {
+      const all = [];
+      try {
+        for (let idx = 0; idx < chunks.length; idx++) {
+          if (handle.aborted) break;
+          const chunk = chunks[idx];
+          let attempt = 0;
+          while (true) {
+            await awaitCapacity(chunk.length, handle);
+            if (handle.aborted) return all;
+            recordSubcalls(chunk.length);
+            if (chunks.length > 1) {
+              setStatus('Sending batch ' + (idx + 1) + ' / ' + chunks.length +
+                        ' (' + chunk.length + ' calls)…');
+            }
+            const out = await sendChunk(chunk);
+            if (out.ok) { all.push.apply(all, out.results); break; }
+            if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
+              const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
+              setStatus('Rate limit hit on batch ' + (idx + 1) + ' / ' + chunks.length +
+                        '. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
+              await sleep(waitMs);
+              rateState.events.length = 0;
+              attempt++;
+              continue;
+            }
+            // Non-rate-limit failure (or exhausted retries): record per-subcall.
+            all.push.apply(all, chunk.map(() => ({ __error: out.err })));
+            break;
+          }
+        }
+        return all;
+      } finally {
+        ui.inflight.delete(handle);
+      }
+    })();
   }
 
   // ── Unit + format helpers ────────────────────────────────────────────────
