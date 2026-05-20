@@ -25,7 +25,7 @@ geotab.addin.fuelBulkEditor = function () {
   'use strict';
 
   // ── Constants ────────────────────────────────────────────────────────────
-  const MULTICALL_CHUNK = 100;            // BUILD_GUIDE §6
+  const MULTICALL_CHUNK = 200;            // BUILD_GUIDE §6
   const RESULTS_LIMIT   = 50000;          // matches official fuel-tracker-edit
   const L_PER_GAL_US    = 3.785411784;
   const KM_PER_MI       = 1.609344;
