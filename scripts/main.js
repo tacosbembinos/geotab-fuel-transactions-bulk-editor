@@ -98,7 +98,9 @@ geotab.addin.fuelBulkEditor = function () {
     tableFilter: 'all',         // chip filter: 'all'|'matched'|'changed'|'unmatched'|'duplicates'|'pending'
     matchResult: null,          // last CSV match result (drives Step 2 review strip)
     matchedTxIds: new Set(),    // tx.ids that came from the last CSV match
-    changedTxIds: new Set()     // tx.ids where the CSV proposed changes
+    changedTxIds: new Set(),    // tx.ids where the CSV proposed changes
+    activeEdit: null,           // { id, field } for the currently-editing inline cell, or null
+    suppressBlurCommit: false   // set briefly when Esc cancels, so the blur handler skips commit
   };
 
   // Cancellation contract:
@@ -749,6 +751,182 @@ geotab.addin.fuelBulkEditor = function () {
     }).join('');
   }
 
+  // ── Inline cell editor ──────────────────────────────────────────────────
+  // Click an editable cell → it becomes an <input>/<select> in place.
+  // Enter commits, Esc reverts, Tab moves to next editable cell (Shift+Tab
+  // moves backwards). Blur commits. Replaces the modal-based edit flow.
+  //
+  // EDITABLE_CELL_MAP: column field → (input shape, formatter, parser).
+  //   format(raw)  — convert canonical value → input value string
+  //   parse(str)   — convert input value string → canonical value
+  // Editable fields and their tab order. Mirrors EDITABLE_FIELDS but in
+  // visual column order so Tab walks left-to-right across the row.
+  const EDIT_FIELD_ORDER = Object.freeze([
+    'dateTime', 'productType', 'volume', 'cost', 'currencyCode', 'odometer', 'comments'
+  ]);
+  const EDITABLE_CELL_MAP = {
+    dateTime: {
+      kind: 'input', type: 'datetime-local',
+      format: function (v) { return isoToLocalInput(v); },
+      parse:  function (s) { return localInputToIso(s); }
+    },
+    productType: {
+      kind: 'select', options: PRODUCT_TYPES,
+      format: function (v) { return v || ''; },
+      parse:  function (s) { return s; }
+    },
+    volume: {
+      kind: 'input', type: 'number', step: '0.001', min: '0',
+      format: function (v) { return v != null ? fmtNum(toDisplayVolume(v), 3) : ''; },
+      parse:  function (s) { return s === '' ? null : fromDisplayVolume(Number(s)); }
+    },
+    cost: {
+      kind: 'input', type: 'number', step: '0.01', min: '0',
+      format: function (v) { return v != null ? fmtNum(v, 2) : ''; },
+      parse:  function (s) { return s === '' ? null : Number(s); }
+    },
+    currencyCode: {
+      kind: 'select', options: CURRENCIES,
+      format: function (v) { return v || ''; },
+      parse:  function (s) { return s; }
+    },
+    odometer: {
+      kind: 'input', type: 'number', step: '1', min: '0',
+      format: function (v) { return v != null ? fmtNum(toDisplayOdo(v), 0) : ''; },
+      parse:  function (s) { return s === '' ? null : fromDisplayOdo(Number(s)); }
+    },
+    comments: {
+      kind: 'input', type: 'text',
+      format: function (v) { return v || ''; },
+      parse:  function (s) { return String(s).slice(0, 1024); }
+    }
+  };
+
+  function cellEditorHtml(field, cur) {
+    const spec = EDITABLE_CELL_MAP[field];
+    if (!spec) return '';
+    const formatted = spec.format(cur);
+    if (spec.kind === 'select') {
+      return '<select class="ftbe-cell-input" aria-label="Edit ' + field + '">' +
+        spec.options.map(function (o) {
+          return '<option value="' + escapeHtml(o) + '"' +
+                 (String(o) === String(cur) ? ' selected' : '') + '>' +
+                 escapeHtml(o) + '</option>';
+        }).join('') +
+      '</select>';
+    }
+    return '<input class="ftbe-cell-input" type="' + spec.type + '"' +
+      (spec.step ? ' step="' + spec.step + '"' : '') +
+      (spec.min  ? ' min="'  + spec.min  + '"' : '') +
+      ' value="' + escapeHtml(formatted) + '"' +
+      ' aria-label="Edit ' + field + '">';
+  }
+
+  // Emit a <td>. If this row + field is currently active for inline edit,
+  // emit an editor input; otherwise emit the diff-aware default cell. The
+  // data-edit-field attribute marks editable cells for the click handler
+  // (and also tells the post-render focus-restore helper where to land).
+  function cellTd(d, field, defaultHtml, opts) {
+    opts = opts || {};
+    const cls = opts.class ? (' class="' + opts.class + '"') : '';
+    if (!EDITABLE_CELL_MAP[field]) {
+      return '<td' + cls + '>' + defaultHtml + '</td>';
+    }
+    const isEdit = ui.activeEdit && ui.activeEdit.id === d.id && ui.activeEdit.field === field;
+    if (isEdit) {
+      const patch = ui.edited.get(d.id) || {};
+      const cur = patch[field] != null ? patch[field] : d[field];
+      const cellCls = (opts.class ? opts.class + ' ' : '') + 'ftbe-cell-editing';
+      return '<td class="' + cellCls + '" data-edit-field="' + field + '">' +
+             cellEditorHtml(field, cur) + '</td>';
+    }
+    return '<td' + cls + ' data-edit-field="' + field + '">' + defaultHtml + '</td>';
+  }
+
+  function enterCellEdit(id, field) {
+    if (!EDITABLE_CELL_MAP[field]) return;
+    if (ui.activeEdit && (ui.activeEdit.id !== id || ui.activeEdit.field !== field)) {
+      // The prior cell's blur handler should have committed already, but
+      // commit defensively here in case the click landed before blur fired.
+      const prev = document.querySelector('.ftbe-cell-editing .ftbe-cell-input');
+      if (prev) commitCellEdit(ui.activeEdit.id, ui.activeEdit.field, prev.value, 0);
+    }
+    ui.activeEdit = { id: id, field: field };
+    renderTable();
+    focusActiveEditInput();
+  }
+
+  function focusActiveEditInput() {
+    if (!ui.activeEdit) return;
+    const tr = document.querySelector('tr[data-id="' + ui.activeEdit.id + '"]');
+    if (!tr) return;
+    const input = tr.querySelector('td.ftbe-cell-editing .ftbe-cell-input');
+    if (!input) return;
+    input.focus();
+    if (input.select) try { input.select(); } catch (_) {}
+  }
+
+  // Commit a cell edit. moveDir: -1 (Shift+Tab), 0 (Enter/blur), +1 (Tab).
+  // After commit, if moveDir ≠ 0, advance to the next editable cell.
+  function commitCellEdit(id, field, rawValue, moveDir) {
+    const spec = EDITABLE_CELL_MAP[field];
+    if (!spec) return;
+    const row = ui.rows.find(function (r) { return r.id === id; });
+    if (!row) { ui.activeEdit = null; renderTable(); return; }
+    let parsed;
+    try { parsed = spec.parse(rawValue); } catch (_) { parsed = null; }
+    // Run through sanitizePatch so the value is whitelisted/coerced the
+    // same way the modal Save path does it.
+    const sanitized = sanitizePatch(makeOne(field, parsed));
+    const existing = ui.edited.get(id) || {};
+    const next = Object.assign({}, existing);
+    if (sanitized[field] != null && isCellChanged(row[field], sanitized[field])) {
+      next[field] = sanitized[field];
+      ui.edited.set(id, next);
+    } else {
+      // Either invalid or matches the server value — drop any prior patch
+      // for this field so the cell goes back to "no diff".
+      if (next[field] != null) {
+        delete next[field];
+        if (Object.keys(next).length) ui.edited.set(id, next);
+        else ui.edited.delete(id);
+      }
+    }
+    ui.activeEdit = null;
+    if (moveDir) {
+      const target = nextEditableCell(id, field, moveDir);
+      if (target) ui.activeEdit = target;
+    }
+    renderTable();
+    if (ui.activeEdit) focusActiveEditInput();
+  }
+  function makeOne(k, v) { const o = {}; o[k] = v; return o; }
+
+  function cancelCellEdit() {
+    if (!ui.activeEdit) return;
+    ui.activeEdit = null;
+    ui.suppressBlurCommit = true;
+    renderTable();
+    // Clear the flag on the next tick so subsequent blurs work normally.
+    setTimeout(function () { ui.suppressBlurCommit = false; }, 0);
+  }
+
+  function nextEditableCell(id, field, dir) {
+    const idx = EDIT_FIELD_ORDER.indexOf(field);
+    if (idx < 0) return null;
+    let nextIdx = idx + dir;
+    let nextId = id;
+    if (nextIdx < 0 || nextIdx >= EDIT_FIELD_ORDER.length) {
+      const rowIdx = virtualRows.findIndex(function (r) { return r.id === id; });
+      if (rowIdx < 0) return null;
+      const sib = virtualRows[rowIdx + dir];
+      if (!sib) return null;
+      nextId = sib.id;
+      nextIdx = dir > 0 ? 0 : EDIT_FIELD_ORDER.length - 1;
+    }
+    return { id: nextId, field: EDIT_FIELD_ORDER[nextIdx] };
+  }
+
   // ── Row HTML builder ────────────────────────────────────────────────────
   // Pure function — no DOM reads, no side effects on `ui`. Building this
   // once per visible row (≈30-50) instead of once per loaded row (6.6k+) is
@@ -798,21 +976,20 @@ geotab.addin.fuelBulkEditor = function () {
     return '<tr data-id="' + escapeHtml(d.id) + '" class="' + rowClasses.join(' ') + '"' + dupTip + '>' +
       '<td class="addin-col-check"><input type="checkbox" class="ftbe-row-check" ' +
           (isSel ? 'checked' : '') + ' aria-label="Select row"></td>' +
-      '<td>' + dtCell + '</td>' +
+      cellTd(d, 'dateTime', dtCell, {}) +
       '<td>' + escapeHtml(d.deviceName) + '</td>' +
       '<td>' + escapeHtml(d.driverName) + '</td>' +
-      '<td>' + prodCell + '</td>' +
-      '<td class="addin-col-num">' + volCell + '</td>' +
-      '<td class="addin-col-num">' + costCell + '</td>' +
-      '<td>' + curCell + '</td>' +
-      '<td class="addin-col-num">' + odoCell + '</td>' +
+      cellTd(d, 'productType', prodCell, {}) +
+      cellTd(d, 'volume', volCell,  { class: 'addin-col-num' }) +
+      cellTd(d, 'cost',   costCell, { class: 'addin-col-num' }) +
+      cellTd(d, 'currencyCode', curCell, {}) +
+      cellTd(d, 'odometer', odoCell, { class: 'addin-col-num' }) +
       '<td>' + escapeHtml(d.siteName) + '</td>' +
       '<td>' + escapeHtml(d.cardNumber) + '</td>' +
-      '<td>' + cmtCell + '</td>' +
+      cellTd(d, 'comments', cmtCell, {}) +
       '<td class="addin-col-actions">' +
-        '<button type="button" class="addin-row-btn" data-action="edit">Edit</button>' +
-        (isEdited ? ' <button type="button" class="addin-row-btn" data-action="revert">Revert</button>' : '') +
-        ' <button type="button" class="addin-row-btn addin-row-btn--danger" data-action="delete">Delete</button>' +
+        (isEdited ? '<button type="button" class="addin-row-btn" data-action="revert" aria-label="Revert pending edits on this row">Revert</button> ' : '') +
+        '<button type="button" class="addin-row-btn addin-row-btn--danger" data-action="delete" aria-label="Delete this transaction">Delete</button>' +
       '</td>' +
     '</tr>';
   }
@@ -910,6 +1087,10 @@ geotab.addin.fuelBulkEditor = function () {
       parts.push('<tr class="ftbe-vspacer" aria-hidden="true" style="height:' + bottomPad + 'px"><td colspan="13"></td></tr>');
     }
     tbody.innerHTML = parts.join('');
+    // If the user was mid-edit when this re-render fired (e.g. scrolled
+    // during edit, or virtualization replaced the row's DOM), restore the
+    // focus + selection so typing isn't interrupted.
+    if (ui.activeEdit) focusActiveEditInput();
   }
 
   // Scroll + resize handlers — rAF-coalesced so a fast scroll fires one
@@ -967,6 +1148,12 @@ geotab.addin.fuelBulkEditor = function () {
     if (name === ui.tableFilter) return;
     ui.tableFilter = name || 'all';
     renderTable();
+    // Announce to screen readers — sighted users see the chip + count change;
+    // screen-reader users get a live-region update instead.
+    announceLive(
+      'Filter set to ' + (name === 'all' ? 'all' : name) +
+      ' — ' + virtualRows.length + ' transactions shown'
+    );
   }
 
   // ── Zenith summary tiles ────────────────────────────────────────────────
@@ -1010,6 +1197,9 @@ geotab.addin.fuelBulkEditor = function () {
       th.classList.remove('is-sort-asc', 'is-sort-desc');
       if (th.getAttribute('data-sort') === ui.sortKey) {
         th.classList.add(ui.sortDir === 'asc' ? 'is-sort-asc' : 'is-sort-desc');
+        th.setAttribute('aria-sort', ui.sortDir === 'asc' ? 'ascending' : 'descending');
+      } else {
+        th.setAttribute('aria-sort', 'none');
       }
     });
   }
@@ -2219,6 +2409,41 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── Modal a11y ───────────────────────────────────────────────────────────
+  // Selector for "what counts as a focusable element". Used by the modal
+  // focus trap to wrap Tab + Shift+Tab inside the dialog (WCAG 2.4.3 +
+  // 2.1.2 — keyboard users mustn't fall out of an open dialog).
+  const FOCUSABLE_SEL =
+    'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+    'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function modalFocusables(modal) {
+    return Array.prototype.filter.call(
+      modal.querySelectorAll(FOCUSABLE_SEL),
+      function (el) { return !el.hasAttribute('disabled') && el.offsetParent !== null; }
+    );
+  }
+
+  let modalTrapHandler = null;
+  function installModalFocusTrap(modal) {
+    if (modalTrapHandler) modal.removeEventListener('keydown', modalTrapHandler);
+    modalTrapHandler = function (e) {
+      if (e.key !== 'Tab') return;
+      const list = modalFocusables(modal);
+      if (!list.length) return;
+      const first = list[0], last = list[list.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+      }
+    };
+    modal.addEventListener('keydown', modalTrapHandler);
+  }
+  function uninstallModalFocusTrap(modal) {
+    if (modalTrapHandler) modal.removeEventListener('keydown', modalTrapHandler);
+    modalTrapHandler = null;
+  }
+
   function showModal(onSave, infoOnly) {
     const modal = $('ftbe-modal');
     if (!modal) return;
@@ -2235,6 +2460,7 @@ geotab.addin.fuelBulkEditor = function () {
         try { if (onSave) onSave(); } finally { hideModal(); }
       };
     }
+    installModalFocusTrap(modal);
     // Focus first focusable inside the panel for keyboard users.
     const firstField = modal.querySelector('.addin-modal__body input, .addin-modal__body select, .addin-modal__body textarea, .addin-modal__body button');
     if (firstField) setTimeout(() => firstField.focus(), 0);
@@ -2242,6 +2468,7 @@ geotab.addin.fuelBulkEditor = function () {
   function hideModal() {
     const modal = $('ftbe-modal');
     if (!modal) return;
+    uninstallModalFocusTrap(modal);
     modal.hidden = true;
     modal.setAttribute('inert', '');
     modal.setAttribute('aria-hidden', 'true');
@@ -2255,6 +2482,27 @@ geotab.addin.fuelBulkEditor = function () {
       try { ui.lastFocusEl.focus(); } catch (_) {}
     }
     ui.lastFocusEl = null;
+  }
+
+  // ── ARIA live announcer ────────────────────────────────────────────────
+  // Routes status messages through a dedicated polite-live region so screen
+  // readers announce row counts, sort changes, etc. without our verbose
+  // status pill having to fight for the same role. Uses a single hidden
+  // <div> appended to .addin-root on first use.
+  function announceLive(msg) {
+    let el = document.getElementById('ftbe-live-region');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'ftbe-live-region';
+      el.className = 'visually-hidden';
+      el.setAttribute('aria-live', 'polite');
+      el.setAttribute('aria-atomic', 'true');
+      const root = document.querySelector('.addin-root');
+      if (root) root.appendChild(el);
+    }
+    // Force a change event for repeat messages by clearing first.
+    el.textContent = '';
+    setTimeout(function () { el.textContent = msg || ''; }, 30);
   }
 
   // ── Default date range (last 30 days) ────────────────────────────────────
@@ -2430,13 +2678,24 @@ geotab.addin.fuelBulkEditor = function () {
     const sugDismiss = $('ftbe-suggest-dismiss');
     if (sugDismiss) sugDismiss.addEventListener('click', () => { const s = $('ftbe-suggested'); if (s) s.hidden = true; });
 
-    // ── Sort headers ───────────────────────────────────────────────────
+    // ── Sort headers (mouse + keyboard) ────────────────────────────────
     document.querySelectorAll('#ftbe-table thead th[data-sort]').forEach((th) => {
-      th.addEventListener('click', () => {
+      const toggleSort = () => {
         const k = th.getAttribute('data-sort');
         if (ui.sortKey === k) ui.sortDir = ui.sortDir === 'asc' ? 'desc' : 'asc';
         else { ui.sortKey = k; ui.sortDir = 'asc'; }
         applySortAndRender();
+        announceLive(
+          'Sorted by ' + th.textContent.trim() + ' ' +
+          (ui.sortDir === 'asc' ? 'ascending' : 'descending')
+        );
+      };
+      th.addEventListener('click', toggleSort);
+      th.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleSort();
+        }
       });
     });
 
@@ -2448,8 +2707,9 @@ geotab.addin.fuelBulkEditor = function () {
       renderTable();
     });
 
-    // ── Delegated tbody handler ────────────────────────────────────────
-    $('ftbe-tbody').addEventListener('click', (e) => {
+    // ── Delegated tbody handlers (click + keydown + blur) ──────────────
+    const tbody = $('ftbe-tbody');
+    tbody.addEventListener('click', (e) => {
       const pendingTr = e.target.closest('tr.is-unmatched-preview');
       if (pendingTr && e.target.matches('button[data-action="dismiss-pending"]')) {
         const idx = Number(e.target.getAttribute('data-pending-idx'));
@@ -2460,6 +2720,8 @@ geotab.addin.fuelBulkEditor = function () {
       const tr = e.target.closest('tr[data-id]');
       if (!tr) return;
       const id = tr.getAttribute('data-id');
+
+      // Row checkbox → toggle selection.
       if (e.target.classList && e.target.classList.contains('ftbe-row-check')) {
         if (e.target.checked) ui.selected.add(id); else ui.selected.delete(id);
         updateActionBar();
@@ -2467,13 +2729,51 @@ geotab.addin.fuelBulkEditor = function () {
         tr.classList.toggle('is-selected', e.target.checked);
         return;
       }
+      // Row action buttons.
       if (e.target.matches('button[data-action]')) {
         const action = e.target.getAttribute('data-action');
-        if (action === 'edit')   openEditModal(id);
         if (action === 'revert') { ui.edited.delete(id); renderTable(); }
         if (action === 'delete') deleteRows([id]);
+        return;
+      }
+      // Inline cell edit — click on an editable cell that isn't itself an
+      // input/select (i.e. the row isn't already in edit mode for this td).
+      const editTd = e.target.closest('td[data-edit-field]');
+      if (editTd && !e.target.closest('input, select, button')) {
+        enterCellEdit(id, editTd.getAttribute('data-edit-field'));
       }
     });
+    // Inline cell editor keyboard handling.
+    tbody.addEventListener('keydown', (e) => {
+      const input = e.target.closest('.ftbe-cell-input');
+      if (!input) return;
+      const td = input.closest('td[data-edit-field]');
+      const tr = td && td.closest('tr[data-id]');
+      if (!tr) return;
+      const id = tr.getAttribute('data-id');
+      const field = td.getAttribute('data-edit-field');
+      if (e.key === 'Enter')  { e.preventDefault(); commitCellEdit(id, field, input.value, 0); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelCellEdit(); }
+      else if (e.key === 'Tab') {
+        e.preventDefault();
+        commitCellEdit(id, field, input.value, e.shiftKey ? -1 : 1);
+      }
+    });
+    // Commit on blur (clicking elsewhere should save, mirroring Excel).
+    // Capture phase because the blur event doesn't bubble on inputs.
+    tbody.addEventListener('blur', (e) => {
+      const input = e.target.closest && e.target.closest('.ftbe-cell-input');
+      if (!input) return;
+      if (ui.suppressBlurCommit) return;
+      const td = input.closest('td[data-edit-field]');
+      const tr = td && td.closest('tr[data-id]');
+      if (!tr) return;
+      const id = tr.getAttribute('data-id');
+      const field = td.getAttribute('data-edit-field');
+      if (ui.activeEdit && ui.activeEdit.id === id && ui.activeEdit.field === field) {
+        commitCellEdit(id, field, input.value, 0);
+      }
+    }, true);
 
     // ── Modal close ────────────────────────────────────────────────────
     document.querySelectorAll('#ftbe-modal [data-modal-close]').forEach((el) => {

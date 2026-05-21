@@ -153,6 +153,28 @@
   clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 
+/* Skip-to-content link — hidden until focused, then floats over the
+   header so a keyboard user can jump straight to the table data. */
+.addin-root .ftbe-skip-link {
+  position: absolute;
+  top: 6px; left: 6px;
+  z-index: 100;
+  padding: var(--zen-space-2) var(--zen-space-3);
+  background: var(--zen-borders-form-field--active);
+  color: var(--zen-text-on-accent);
+  font-size: var(--zen-font-sm);
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: var(--zen-radius-md);
+  transform: translateY(-200%);
+  transition: transform var(--zen-dur-fast) var(--zen-ease);
+}
+.addin-root .ftbe-skip-link:focus {
+  transform: translateY(0);
+  outline: none;
+  box-shadow: var(--zen-focus-ring);
+}
+
 /* ── BODY ─────────────────────────────────────────────────────────── */
 .addin-body {
   flex: 1; min-height: 0;
@@ -375,6 +397,39 @@
   padding: 0 !important;
   pointer-events: none;
 }
+
+/* ── Inline cell editor ──────────────────────────────────────────────
+   Editable cells advertise themselves with a faint hover outline so the
+   user knows "I can click this". When active, the cell switches to an
+   <input>/<select> in place via JS — the .ftbe-cell-editing class kills
+   the cell padding so the input fills the cell exactly. */
+.addin-table tbody td[data-edit-field] {
+  cursor: text;
+  position: relative;
+}
+.addin-table tbody td[data-edit-field]:hover {
+  box-shadow: inset 0 0 0 1px var(--zen-borders-form-field--active);
+}
+.addin-table tbody td.ftbe-cell-editing {
+  padding: 0 !important;
+  box-shadow: inset 0 0 0 2px var(--zen-borders-form-field--active);
+}
+.addin-table tbody td.ftbe-cell-editing .ftbe-cell-input {
+  width: 100%;
+  height: 100%;
+  min-height: 30px;
+  border: 0;
+  margin: 0;
+  padding: 0 8px;
+  background: var(--zen-backgrounds-main);
+  font: inherit;
+  font-size: var(--zen-font-sm);
+  color: var(--zen-text-primary);
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  box-sizing: border-box;
+}
+.addin-table tbody td.ftbe-cell-editing select.ftbe-cell-input { padding: 0 6px; }
 
 .addin-table tbody tr:hover td  { background: var(--geo-blue-lt); }
 .addin-table tbody tr.is-selected td {
