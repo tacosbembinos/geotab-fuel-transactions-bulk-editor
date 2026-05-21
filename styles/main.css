@@ -897,6 +897,13 @@
    Save pill · Toast host
    ══════════════════════════════════════════════════════════════════════ */
 
+/* The HTML `hidden` attribute must always win over our `display` rules.
+   Without this, components that set `display: flex` (action bar, save
+   pill, inline warning, suggested-actions strip, .btn, …) silently
+   ignore element.hidden = true. Documented CSS-reset pattern;
+   !important is justified because [hidden] is a semantic override. */
+.addin-root [hidden] { display: none !important; }
+
 /* ── STEPPER ─────────────────────────────────────────────────────────── */
 .addin-root .zen-stepper {
   background: var(--zen-backgrounds-main);
@@ -1317,7 +1324,6 @@
   flex-shrink: 0;
   animation: zen-slide-up var(--zen-dur-base) var(--zen-ease);
 }
-.addin-root .ftbe-action-bar[hidden] { display: none; }
 .addin-root .ftbe-action-bar__count {
   font-size: var(--zen-font-md);
   color: var(--zen-text-secondary);
@@ -1348,8 +1354,6 @@
   box-shadow: var(--zen-shadow-2);
   animation: zen-slide-up var(--zen-dur-base) var(--zen-ease);
 }
-.addin-root .ftbe-save-pill[hidden] { display: none; }
-
 /* When both the action bar and save pill are visible, push the save pill
    up further so it doesn't overlap the bar. */
 .addin-root .ftbe-action-bar:not([hidden]) ~ .ftbe-save-pill {

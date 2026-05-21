@@ -581,6 +581,11 @@ geotab.addin.fuelBulkEditor = function () {
     ui.matchResult = null;
     ui.lastMatchCounts = null;
     ui.tableFilter = 'all';
+    // Suggested-actions strip is only driven by enterReviewStep (CSV path);
+    // a fresh non-CSV Load must reset it or the previous run's buttons
+    // linger with stale zero-count labels.
+    const sug = $('ftbe-suggested');
+    if (sug) sug.hidden = true;
     renderTable();
 
     const myGen = ui.opGen;
