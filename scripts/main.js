@@ -749,12 +749,99 @@ geotab.addin.fuelBulkEditor = function () {
     }).join('');
   }
 
+  // ── Row HTML builder ────────────────────────────────────────────────────
+  // Pure function — no DOM reads, no side effects on `ui`. Building this
+  // once per visible row (≈30-50) instead of once per loaded row (6.6k+) is
+  // what unlocks 60fps scrolling on large queries. See renderVirtualWindow.
+  function buildRowHtml(d) {
+    const isSel = ui.selected.has(d.id);
+    const isEdited = ui.edited.has(d.id);
+    const isDupTarget = (ui.duplicateTargets.get(d.id) || 0) > 1;
+    const patch = ui.edited.get(d.id) || {};
+
+    // Old (server) vs new (post-patch) raw values, by field.
+    const newVol = patch.volume       != null ? patch.volume       : d.volume;
+    const newCost = patch.cost        != null ? patch.cost         : d.cost;
+    const newOdo  = patch.odometer    != null ? patch.odometer     : d.odometer;
+    const newCur  = patch.currencyCode!= null ? patch.currencyCode : d.currencyCode;
+    const newProd = patch.productType != null ? patch.productType  : d.productType;
+    const newCmt  = patch.comments    != null ? patch.comments     : d.comments;
+    const newDt   = patch.dateTime    != null ? patch.dateTime     : d.dateTime;
+
+    const dtCell   = diffCell(d.dateTime, patch.dateTime != null ? newDt : null,
+                              fmtDateTime(newDt),
+                              { displayOld: fmtDateTime(d.dateTime) });
+    const prodCell = diffCell(d.productType, patch.productType != null ? newProd : null, newProd || '');
+    const volCell  = diffCell(d.volume, patch.volume != null ? newVol : null,
+                              newVol != null ? fmtNum(toDisplayVolume(newVol), 3) : '',
+                              { numeric: true,
+                                displayOld: d.volume != null ? fmtNum(toDisplayVolume(d.volume), 3) + ' ' + ui.volUnit : '(empty)' });
+    const costCell = diffCell(d.cost, patch.cost != null ? newCost : null,
+                              newCost != null ? fmtNum(newCost, 2) : '',
+                              { numeric: true });
+    const curCell  = diffCell(d.currencyCode, patch.currencyCode != null ? newCur : null, newCur || '');
+    const odoCell  = diffCell(d.odometer, patch.odometer != null ? newOdo : null,
+                              newOdo != null ? fmtNum(toDisplayOdo(newOdo), 0) : '',
+                              { numeric: true,
+                                displayOld: d.odometer != null ? fmtNum(toDisplayOdo(d.odometer), 0) + ' ' + ui.odoUnit : '(empty)' });
+    const cmtCell  = diffCell(d.comments, patch.comments != null ? newCmt : null, newCmt || '');
+
+    const rowClasses = ['ftbe-row'];
+    if (isSel)       rowClasses.push('is-selected');
+    if (isEdited)    rowClasses.push('is-edited');
+    if (isDupTarget) rowClasses.push('is-dup-target');
+
+    const dupTip = isDupTarget
+      ? ' title="Warning: ' + ui.duplicateTargets.get(d.id) + ' CSV rows matched this same FuelTransaction. Only the last set of edits will be kept."'
+      : '';
+
+    return '<tr data-id="' + escapeHtml(d.id) + '" class="' + rowClasses.join(' ') + '"' + dupTip + '>' +
+      '<td class="addin-col-check"><input type="checkbox" class="ftbe-row-check" ' +
+          (isSel ? 'checked' : '') + ' aria-label="Select row"></td>' +
+      '<td>' + dtCell + '</td>' +
+      '<td>' + escapeHtml(d.deviceName) + '</td>' +
+      '<td>' + escapeHtml(d.driverName) + '</td>' +
+      '<td>' + prodCell + '</td>' +
+      '<td class="addin-col-num">' + volCell + '</td>' +
+      '<td class="addin-col-num">' + costCell + '</td>' +
+      '<td>' + curCell + '</td>' +
+      '<td class="addin-col-num">' + odoCell + '</td>' +
+      '<td>' + escapeHtml(d.siteName) + '</td>' +
+      '<td>' + escapeHtml(d.cardNumber) + '</td>' +
+      '<td>' + cmtCell + '</td>' +
+      '<td class="addin-col-actions">' +
+        '<button type="button" class="addin-row-btn" data-action="edit">Edit</button>' +
+        (isEdited ? ' <button type="button" class="addin-row-btn" data-action="revert">Revert</button>' : '') +
+        ' <button type="button" class="addin-row-btn addin-row-btn--danger" data-action="delete">Delete</button>' +
+      '</td>' +
+    '</tr>';
+  }
+
+  // ── Virtualized table renderer ──────────────────────────────────────────
+  // Renders only the rows currently in (or near) the viewport, plus a top
+  // and bottom spacer <tr> with computed pixel heights so the scroll
+  // container's scrollHeight matches a fully-rendered table. This means:
+  //   - sticky <thead> still works (it's a real <tr> in <thead>, never a
+  //     spacer);
+  //   - the scrollbar thumb stays accurate;
+  //   - sort/filter/state-change re-renders touch ≤ ~50 rows instead of
+  //     all 6,632.
+  // ROW_HEIGHT must match the CSS row height (32px); BUFFER_ROWS controls
+  // how many off-screen rows are pre-rendered above and below to smooth
+  // out fast scrolls.
+  const ROW_HEIGHT  = 32;
+  const BUFFER_ROWS = 8;
+
+  // Snapshot of the last derived rows; the scroll handler re-uses this
+  // without re-deriving (would be wasteful and is not state-dependent).
+  let virtualRows = [];
+
   function renderTable() {
     const tbody = $('ftbe-tbody');
     if (!tbody) return;
-    const rows = deriveDisplayRows();
+    virtualRows = deriveDisplayRows();
     const unmatchedHtml = unmatchedPreviewRowsHtml();
-    if (!rows.length && !unmatchedHtml) {
+    if (!virtualRows.length && !unmatchedHtml) {
       tbody.innerHTML = '<tr><td colspan="13" class="addin-empty">No transactions match.</td></tr>';
       updateActionBar();
       updateSortIndicators();
@@ -763,70 +850,7 @@ geotab.addin.fuelBulkEditor = function () {
       updateStepperState();
       return;
     }
-    const html = rows.map((d) => {
-      const isSel = ui.selected.has(d.id);
-      const isEdited = ui.edited.has(d.id);
-      const isDupTarget = (ui.duplicateTargets.get(d.id) || 0) > 1;
-      const patch = ui.edited.get(d.id) || {};
-
-      // Old (server) vs new (post-patch) raw values, by field.
-      const newVol = patch.volume       != null ? patch.volume       : d.volume;
-      const newCost = patch.cost        != null ? patch.cost         : d.cost;
-      const newOdo  = patch.odometer    != null ? patch.odometer     : d.odometer;
-      const newCur  = patch.currencyCode!= null ? patch.currencyCode : d.currencyCode;
-      const newProd = patch.productType != null ? patch.productType  : d.productType;
-      const newCmt  = patch.comments    != null ? patch.comments     : d.comments;
-      const newDt   = patch.dateTime    != null ? patch.dateTime     : d.dateTime;
-
-      const dtCell   = diffCell(d.dateTime, patch.dateTime != null ? newDt : null,
-                                fmtDateTime(newDt),
-                                { displayOld: fmtDateTime(d.dateTime) });
-      const prodCell = diffCell(d.productType, patch.productType != null ? newProd : null, newProd || '');
-      const volCell  = diffCell(d.volume, patch.volume != null ? newVol : null,
-                                newVol != null ? fmtNum(toDisplayVolume(newVol), 3) : '',
-                                { numeric: true,
-                                  displayOld: d.volume != null ? fmtNum(toDisplayVolume(d.volume), 3) + ' ' + ui.volUnit : '(empty)' });
-      const costCell = diffCell(d.cost, patch.cost != null ? newCost : null,
-                                newCost != null ? fmtNum(newCost, 2) : '',
-                                { numeric: true });
-      const curCell  = diffCell(d.currencyCode, patch.currencyCode != null ? newCur : null, newCur || '');
-      const odoCell  = diffCell(d.odometer, patch.odometer != null ? newOdo : null,
-                                newOdo != null ? fmtNum(toDisplayOdo(newOdo), 0) : '',
-                                { numeric: true,
-                                  displayOld: d.odometer != null ? fmtNum(toDisplayOdo(d.odometer), 0) + ' ' + ui.odoUnit : '(empty)' });
-      const cmtCell  = diffCell(d.comments, patch.comments != null ? newCmt : null, newCmt || '');
-
-      const rowClasses = ['ftbe-row'];
-      if (isSel) rowClasses.push('is-selected');
-      if (isEdited) rowClasses.push('is-edited');
-      if (isDupTarget) rowClasses.push('is-dup-target');
-
-      const dupTip = isDupTarget
-        ? ' title="Warning: ' + ui.duplicateTargets.get(d.id) + ' CSV rows matched this same FuelTransaction. Only the last set of edits will be kept."'
-        : '';
-
-      return '<tr data-id="' + escapeHtml(d.id) + '" class="' + rowClasses.join(' ') + '"' + dupTip + '>' +
-        '<td class="addin-col-check"><input type="checkbox" class="ftbe-row-check" ' +
-            (isSel ? 'checked' : '') + ' aria-label="Select row"></td>' +
-        '<td>' + dtCell + '</td>' +
-        '<td>' + escapeHtml(d.deviceName) + '</td>' +
-        '<td>' + escapeHtml(d.driverName) + '</td>' +
-        '<td>' + prodCell + '</td>' +
-        '<td class="addin-col-num">' + volCell + '</td>' +
-        '<td class="addin-col-num">' + costCell + '</td>' +
-        '<td>' + curCell + '</td>' +
-        '<td class="addin-col-num">' + odoCell + '</td>' +
-        '<td>' + escapeHtml(d.siteName) + '</td>' +
-        '<td>' + escapeHtml(d.cardNumber) + '</td>' +
-        '<td>' + cmtCell + '</td>' +
-        '<td class="addin-col-actions">' +
-          '<button type="button" class="addin-row-btn" data-action="edit">Edit</button>' +
-          (isEdited ? ' <button type="button" class="addin-row-btn" data-action="revert">Revert</button>' : '') +
-          ' <button type="button" class="addin-row-btn addin-row-btn--danger" data-action="delete">Delete</button>' +
-        '</td>' +
-      '</tr>';
-    }).join('');
-    tbody.innerHTML = unmatchedHtml + html;
+    renderVirtualWindow(unmatchedHtml);
     updateActionBar();
     updateSortIndicators();
     updateFilterChips();
@@ -834,6 +858,76 @@ geotab.addin.fuelBulkEditor = function () {
     updateSavePill();
     updateStepperState();
     updateDupWarning();
+  }
+
+  // Re-renders the visible-row window inside <tbody>. Called by renderTable
+  // (for state changes) and by the scroll handler (for viewport changes).
+  // When called from the scroll handler, the caller may omit unmatchedHtml
+  // to skip rebuilding the unmatched-preview block (it doesn't change with
+  // scroll).
+  let lastUnmatchedHtml = '';
+  function renderVirtualWindow(unmatchedHtml) {
+    const tbody = $('ftbe-tbody');
+    const wrap  = document.querySelector('.addin-table-wrap');
+    if (!tbody || !wrap) return;
+    if (unmatchedHtml != null) lastUnmatchedHtml = unmatchedHtml;
+
+    const total = virtualRows.length;
+    if (!total && !lastUnmatchedHtml) return;
+
+    // Account for the sticky <thead> and any unmatched preview rows that
+    // sit pinned at the top of <tbody> outside the virtualized window.
+    const theadEl = wrap.querySelector('thead');
+    const headerH = theadEl ? theadEl.offsetHeight : ROW_HEIGHT;
+    const unmatchedH = ui.unmatchedPreview.length * ROW_HEIGHT;
+
+    const viewportH = wrap.clientHeight || 480;
+    const scrollTop = wrap.scrollTop;
+
+    // How far into the virtualized region the top of the viewport sits.
+    const offsetIntoVirt = Math.max(0, scrollTop - headerH - unmatchedH);
+
+    const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + BUFFER_ROWS * 2;
+    let startIdx = Math.max(0, Math.floor(offsetIntoVirt / ROW_HEIGHT) - BUFFER_ROWS);
+    let endIdx   = Math.min(total, startIdx + visibleCount);
+    // If we're at the bottom, pin endIdx and recompute startIdx so we
+    // always render the configured buffer's worth of rows.
+    if (endIdx - startIdx < visibleCount && endIdx === total) {
+      startIdx = Math.max(0, total - visibleCount);
+    }
+
+    const topPad    = startIdx * ROW_HEIGHT;
+    const bottomPad = (total - endIdx) * ROW_HEIGHT;
+
+    // Build only the visible slice. The empty <td colspan="13"> inside each
+    // spacer keeps the row valid HTML; the height comes from inline style.
+    const parts = [lastUnmatchedHtml];
+    if (topPad > 0) {
+      parts.push('<tr class="ftbe-vspacer" aria-hidden="true" style="height:' + topPad + 'px"><td colspan="13"></td></tr>');
+    }
+    for (let i = startIdx; i < endIdx; i++) parts.push(buildRowHtml(virtualRows[i]));
+    if (bottomPad > 0) {
+      parts.push('<tr class="ftbe-vspacer" aria-hidden="true" style="height:' + bottomPad + 'px"><td colspan="13"></td></tr>');
+    }
+    tbody.innerHTML = parts.join('');
+  }
+
+  // Scroll + resize handlers — rAF-coalesced so a fast scroll fires one
+  // render per frame, not one per scroll event (which can be 100+/sec).
+  let virtRaf = 0;
+  function scheduleVirtualRender() {
+    if (virtRaf) return;
+    virtRaf = requestAnimationFrame(() => {
+      virtRaf = 0;
+      renderVirtualWindow();
+    });
+  }
+  function bindVirtualScroll() {
+    const wrap = document.querySelector('.addin-table-wrap');
+    if (!wrap || wrap.__ftbeVirtBound) return;
+    wrap.__ftbeVirtBound = true;
+    wrap.addEventListener('scroll', scheduleVirtualRender, { passive: true });
+    window.addEventListener('resize', scheduleVirtualRender);
   }
 
   // ── Filter-chip row (replaces the old prose legend strip) ───────────────
@@ -2388,6 +2482,9 @@ geotab.addin.fuelBulkEditor = function () {
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && !$('ftbe-modal').hidden) hideModal();
     });
+
+    // Hook table-wrap scroll + window resize for the virtualized renderer.
+    bindVirtualScroll();
 
     // Prime UI for the initial state.
     setSubMode(ui.subMode);

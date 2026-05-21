@@ -350,13 +350,32 @@
 .addin-table thead th.is-sort-asc::after  { content: ' ↑'; color: var(--geo-blue); }
 .addin-table thead th.is-sort-desc::after { content: ' ↓'; color: var(--geo-blue); }
 
+/* Data row geometry must match the virtualizer's ROW_HEIGHT constant (32px)
+   or the spacer math drifts and the scrollbar thumb misaligns. Height is
+   pinned via `tr { height }`; td padding is sized so text + padding hits
+   the same 32px without forcing the browser to grow rows. */
+.addin-table tbody tr { height: 32px; }
 .addin-table tbody td {
-  padding: 8px 10px;
+  padding: 4px 10px;
   border-bottom: 1px solid var(--geo-grey-200);
   vertical-align: middle;
   white-space: nowrap;
   color: var(--geo-grey-900);
+  box-sizing: border-box;
 }
+/* Virtual-scroller spacer rows. They carry the off-screen pixel height
+   so scrollHeight matches a fully-rendered table; visually they must
+   contribute nothing — no border, no hover, no zebra. */
+.addin-table tbody tr.ftbe-vspacer,
+.addin-table tbody tr.ftbe-vspacer:hover,
+.addin-table tbody tr.ftbe-vspacer td {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  pointer-events: none;
+}
+
 .addin-table tbody tr:hover td  { background: var(--geo-blue-lt); }
 .addin-table tbody tr.is-selected td {
   background: var(--geo-blue-lt);
