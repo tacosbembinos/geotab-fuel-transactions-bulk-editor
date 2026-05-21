@@ -25,26 +25,36 @@ geotab.addin.fuelBulkEditor = function () {
   'use strict';
 
   // ── Constants ────────────────────────────────────────────────────────────
-  const MULTICALL_CHUNK = 200;            // BUILD_GUIDE §6
+  // 100 keeps every chunk well under the tightest documented per-verb bucket
+  // (Remove/Set FuelTransaction = 200/min), so two chunks fit cleanly before
+  // we need to wait. Bigger chunks just trade one round-trip for a 60s stall.
+  const MULTICALL_CHUNK = 100;
   const RESULTS_LIMIT   = 50000;          // matches official fuel-tracker-edit
   const L_PER_GAL_US    = 3.785411784;
   const KM_PER_MI       = 1.609344;
 
-  // Geotab per-user API quota. The HAR capture shows this tenant is provisioned
-  // at "Maximum admitted 200 per 1m." Sub-calls inside an ExecuteMultiCall
-  // count individually, so a naïve 56-chunk save of ~5,600 Set sub-calls trips
-  // the bucket on the 3rd chunk. We throttle proactively on a sliding window,
-  // auto-calibrate from the server's own error message (some tenants run at
-  // 100/min, others higher), and back off reactively when OverLimitException
-  // still slips through (e.g. other MyGeotab tabs sharing the same quota).
-  // Kept as `let` (not frozen) so parseQuotaFromMessage() can adjust live.
-  const RATE_LIMIT = {
-    callsPerWindow:    200,
-    windowMs:          60 * 1000,
-    safetyMargin:      0.9,         // effective cap ≈ 180/min
-    maxRetries:        5,
-    defaultCooldownMs: 60 * 1000    // when err carries no usable hint
+  // Geotab rate limits are tracked per (method, entity, username, database) —
+  // see https://developers.geotab.com/myGeotab/guides/rateLimits/index.html.
+  // The previous single-bucket model conflated Get/Set/Remove and over-
+  // throttled. The values below are the documented Active-tier defaults for
+  // the entities this add-in touches; everything else falls back to
+  // DEFAULT_LIMIT_PER_MIN. parseQuotaFromMessage() adjusts a bucket live if
+  // the server reports a smaller quota than we assumed.
+  const METHOD_LIMITS = {
+    'Add:FuelTransaction':    1000,
+    'Get:FuelTransaction':    250,
+    'Set:FuelTransaction':    200,
+    'Remove:FuelTransaction': 200,
+    'Get:Device':             60,    // doc default for most non-fuel Gets
+    'Get:Driver':             60,
+    'Get:User':               60,
+    'Authenticate':           10,
+    'ExecuteMultiCall':       1000   // envelope itself; subcalls bill their own bucket
   };
+  const DEFAULT_LIMIT_PER_MIN     = 60;
+  const RATE_WINDOW_MS            = 60 * 1000;
+  const RATE_MAX_RETRIES          = 5;
+  const RATE_DEFAULT_COOLDOWN_MS  = 60 * 1000;
 
   const PRODUCT_TYPES = Object.freeze([
     'Unknown', 'Regular', 'Midgrade', 'Premium', 'Super',
@@ -79,7 +89,16 @@ geotab.addin.fuelBulkEditor = function () {
     driverById: new Map(),     // driverId -> name
     volUnit: 'L',
     odoUnit: 'km',
-    lastFocusEl: null          // for modal focus restoration
+    lastFocusEl: null,          // for modal focus restoration
+    // ── Redesign workflow state ─────────────────────────────────────────
+    activeStep: 1,              // 1=Query, 2=Review (3 has no panel — sticky action bar)
+    subMode: 'filters',         // Step 1 sub-mode: 'filters' | 'csv'
+    csvAction: 'match',         // CSV sub-mode action: 'match' | 'stage' | 'force'
+    csvFile: null,              // currently-staged File in CSV mode
+    tableFilter: 'all',         // chip filter: 'all'|'matched'|'changed'|'unmatched'|'duplicates'|'pending'
+    matchResult: null,          // last CSV match result (drives Step 2 review strip)
+    matchedTxIds: new Set(),    // tx.ids that came from the last CSV match
+    changedTxIds: new Set()     // tx.ids where the CSV proposed changes
   };
 
   // Cancellation contract:
@@ -114,9 +133,12 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── API plumbing ─────────────────────────────────────────────────────────
-  // Sliding-window subcall ledger. Each entry { t, n } records how many
-  // sub-calls were emitted at time t. We prune entries older than windowMs.
-  const rateState = { events: [] };
+  // Per-bucket sliding-window ledgers. The bucket key is "Method:TypeName"
+  // (or just the method, for non-entity calls like Authenticate /
+  // ExecuteMultiCall) — exactly the dimension Geotab quotas on. Buckets are
+  // created lazily so we don't have to enumerate every entity up front.
+  // Each bucket: { events: [{t,n}], perMin }.
+  const rateBuckets = new Map();
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
   // Single-flight gate: only ONE api.call / api.multiCall is in flight at a
@@ -131,36 +153,72 @@ geotab.addin.fuelBulkEditor = function () {
     apiGate = run.then(() => {}, () => {});
     return run;
   }
-  function pruneRateEvents(now) {
-    const cutoff = now - RATE_LIMIT.windowMs;
-    while (rateState.events.length && rateState.events[0].t < cutoff) rateState.events.shift();
+
+  function bucketKey(method, typeName) {
+    if (!method) return 'unknown';
+    if (method === 'ExecuteMultiCall' || method === 'Authenticate') return method;
+    return method + ':' + (typeName || '*');
   }
-  function subcallsInWindow(now) {
-    pruneRateEvents(now);
+  function getBucket(key) {
+    let b = rateBuckets.get(key);
+    if (!b) {
+      const perMin = METHOD_LIMITS[key] != null ? METHOD_LIMITS[key] : DEFAULT_LIMIT_PER_MIN;
+      b = { events: [], perMin };
+      rateBuckets.set(key, b);
+    }
+    return b;
+  }
+  function pruneBucket(b, now) {
+    const cutoff = now - RATE_WINDOW_MS;
+    while (b.events.length && b.events[0].t < cutoff) b.events.shift();
+  }
+  function usedInBucket(b, now) {
+    pruneBucket(b, now);
     let sum = 0;
-    for (const e of rateState.events) sum += e.n;
+    for (const e of b.events) sum += e.n;
     return sum;
   }
-  function recordSubcalls(n) { rateState.events.push({ t: Date.now(), n }); }
+  function recordSubcalls(key, n) {
+    const b = getBucket(key);
+    b.events.push({ t: Date.now(), n });
+  }
 
-  async function awaitCapacity(n, abortHandle) {
-    const cap = Math.floor(RATE_LIMIT.callsPerWindow * RATE_LIMIT.safetyMargin);
-    // If a single chunk is larger than the cap (shouldn't happen — chunk≤100,
-    // cap=180), drain the whole window first.
+  // counts: Map<bucketKey, number> — how many subcalls this dispatch will
+  // bill against each bucket. Waits until every bucket can accommodate its
+  // share; uses the LONGEST per-bucket wait so we don't busy-loop.
+  async function awaitCapacity(counts, abortHandle) {
+    // Hard guard against the bug that caused the "Delete Selected" hang:
+    // if we ever request more from one bucket than its entire cap, the
+    // while-loop below could never settle. Catch it loudly instead.
+    for (const [key, n] of counts) {
+      const b = getBucket(key);
+      if (n > b.perMin) {
+        throw new Error('Rate-limit misconfiguration: request of ' + n +
+                        ' subcalls against bucket "' + key + '" (cap ' +
+                        b.perMin + '/min). Reduce MULTICALL_CHUNK.');
+      }
+    }
     while (!(abortHandle && abortHandle.aborted)) {
       const now = Date.now();
-      const used = subcallsInWindow(now);
-      if (used + n <= cap) return;
-      // Walk events oldest-first until enough will have aged out to fit.
-      const need = used + n - cap;
-      let freed = 0, waitUntil = now;
-      for (const e of rateState.events) {
-        freed += e.n;
-        waitUntil = e.t + RATE_LIMIT.windowMs;
-        if (freed >= need) break;
+      let waitMs = 0;
+      let blockingKey = null;
+      for (const [key, n] of counts) {
+        const b = getBucket(key);
+        const used = usedInBucket(b, now);
+        if (used + n <= b.perMin) continue;
+        const need = used + n - b.perMin;
+        let freed = 0, waitUntil = now;
+        for (const e of b.events) {
+          freed += e.n;
+          waitUntil = e.t + RATE_WINDOW_MS;
+          if (freed >= need) break;
+        }
+        const w = Math.max(250, waitUntil - now + 50);
+        if (w > waitMs) { waitMs = w; blockingKey = key; }
       }
-      const waitMs = Math.max(250, waitUntil - now + 50);
-      setStatus('Rate-limit throttle: waiting ' + Math.ceil(waitMs / 1000) + 's before next batch…');
+      if (waitMs === 0) return;
+      setStatus('Rate-limit throttle: waiting ' + Math.ceil(waitMs / 1000) +
+                's for ' + blockingKey + ' bucket…');
       await sleep(waitMs);
     }
   }
@@ -218,22 +276,19 @@ geotab.addin.fuelBulkEditor = function () {
     return { errs, overLimit, firstErr: errs[0].err };
   }
 
-  // Parse "Maximum admitted N per Wm" / "...per Ws" out of the JSON-RPC error
-  // message and adjust RATE_LIMIT live. Geotab provisions quotas per tenant;
-  // a tenant on 100/min would otherwise see this code over-throttle.
-  function parseQuotaFromMessage(err) {
+  // Parse "Maximum admitted N per W{s|m|h}" out of the JSON-RPC error message
+  // and adjust the bucket that tripped. Geotab provisions quotas per
+  // (method, entity, user, db); if the server reports a smaller quota than
+  // our table assumed, we trust the server. We can only narrow the cap, not
+  // widen it, to avoid amplifying a transient burst error.
+  function parseQuotaFromMessage(err, bucketKeyForError) {
     const msg = (err && err.message) || '';
     const m = msg.match(/Maximum admitted\s+(\d+)\s+per\s+(\d+)\s*([smh])/i);
-    if (!m) return;
+    if (!m || !bucketKeyForError) return;
     const n = parseInt(m[1], 10);
-    const w = parseInt(m[2], 10);
-    const unit = m[3].toLowerCase();
-    const ms = (unit === 'h' ? 3600 : unit === 'm' ? 60 : 1) * 1000 * w;
-    if (n > 0 && ms > 0) {
-      RATE_LIMIT.callsPerWindow = n;
-      RATE_LIMIT.windowMs = ms;
-      RATE_LIMIT.defaultCooldownMs = ms;
-    }
+    if (!(n > 0)) return;
+    const b = getBucket(bucketKeyForError);
+    if (n < b.perMin) b.perMin = n;
   }
 
   function parseRetryAfterMs(err) {
@@ -243,7 +298,7 @@ geotab.addin.fuelBulkEditor = function () {
     // to the full window (the server resets the bucket on a fixed cadence).
     const ra = err && (err.retryAfter || (err.data && err.data.retryAfter));
     if (typeof ra === 'number' && isFinite(ra) && ra > 0) return Math.max(1000, ra * 1000);
-    return RATE_LIMIT.defaultCooldownMs;
+    return RATE_DEFAULT_COOLDOWN_MS;
   }
 
   // Wraps api.call in a Promise + tracks a cancel handle in ui.inflight.
@@ -265,30 +320,31 @@ geotab.addin.fuelBulkEditor = function () {
       );
     });
 
+    const key = bucketKey(method, params && params.typeName);
+    const counts = new Map([[key, 1]]);
     return (async () => {
       let attempt = 0;
       try {
         while (true) {
           if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
-          await awaitCapacity(1, handle);
+          await awaitCapacity(counts, handle);
           if (handle.aborted) throw CANCELLED;
           // Single-flight: the call below cannot start until any prior api
           // request has settled. recordSubcalls is moved inside the gate so
           // the ledger is updated atomically with the actual emission.
           const out = await withApiGate(async () => {
-            recordSubcalls(1);
+            recordSubcalls(key, 1);
             return invoke();
           });
           if (handle.aborted || (opts.gen != null && isStale(opts.gen))) throw CANCELLED;
           if (out.ok) return out.res;
-          if (isOverLimitError(out.err) && attempt < RATE_LIMIT.maxRetries) {
-            parseQuotaFromMessage(out.err);
+          if (isOverLimitError(out.err) && attempt < RATE_MAX_RETRIES) {
+            parseQuotaFromMessage(out.err, key);
             const waitMs = Math.floor(parseRetryAfterMs(out.err) * Math.pow(1.25, attempt));
             setStatus('Rate limit hit. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
             await sleep(waitMs);
-            // Do NOT clear rateState.events — they prune naturally once older
-            // than windowMs, and clearing lets the next attempt skip throttling
-            // when other tabs are still consuming the same per-tenant bucket.
+            // Bucket events prune naturally once older than the window;
+            // leaving them shields against other tabs draining the same quota.
             attempt++;
             continue;
           }
@@ -302,7 +358,7 @@ geotab.addin.fuelBulkEditor = function () {
 
   // multiCall in SEQUENTIAL chunks of MULTICALL_CHUNK.
   //   - Validates each sub-call (server aborts a whole batch on one bad shape).
-  //   - Throttles against RATE_LIMIT proactively (sliding window of sub-calls).
+  //   - Throttles against METHOD_LIMITS proactively (per-bucket sliding window).
   //   - Retries the current chunk on OverLimitException — atomic per-batch
   //     (HAR shows requestIndex:0, no sub-calls committed), so re-send is safe.
   //   - Real cancellation between chunks: remaining sub-calls are padded with
@@ -350,9 +406,19 @@ geotab.addin.fuelBulkEditor = function () {
             for (let k = 0; k < rest; k++) all.push(CANCELLED);
             return all;
           }
+          // Bill subcalls to their own (method, entity) buckets, plus one
+          // envelope call to the ExecuteMultiCall bucket. Bucket-aware
+          // capacity check so Remove sub-calls don't stall waiting for Get
+          // headroom (and vice versa).
+          const counts = new Map();
+          counts.set('ExecuteMultiCall', 1);
+          for (const sub of chunk) {
+            const k = bucketKey(sub[0], sub[1] && sub[1].typeName);
+            counts.set(k, (counts.get(k) || 0) + 1);
+          }
           let attempt = 0;
           while (true) {
-            await awaitCapacity(chunk.length, handle);
+            await awaitCapacity(counts, handle);
             if (checkAborted()) {
               const rest = chunks.slice(idx).reduce((n, c) => n + c.length, 0);
               for (let k = 0; k < rest; k++) all.push(CANCELLED);
@@ -363,11 +429,9 @@ geotab.addin.fuelBulkEditor = function () {
                         ' (chunk ' + (idx + 1) + ' of ' + chunks.length + ')…');
             }
             // Single-flight + atomic ledger update: the next multiCall is
-            // not dispatched until the previous one fully settles. This is
-            // the load-bearing guarantee the task asks for — "only send the
-            // next multiCall when the last one is completed."
+            // not dispatched until the previous one fully settles.
             const out = await withApiGate(async () => {
-              recordSubcalls(chunk.length);
+              for (const [k, n] of counts) recordSubcalls(k, n);
               return sendChunk(chunk);
             });
             // multiCall can deliver per-subcall errors via either callback.
@@ -376,17 +440,21 @@ geotab.addin.fuelBulkEditor = function () {
             const overLimit =
               (!out.ok && isOverLimitError(out.err)) ||
               (inline && inline.overLimit);
-            if (overLimit && attempt < RATE_LIMIT.maxRetries) {
+            if (overLimit && attempt < RATE_MAX_RETRIES) {
               const errForMsg = out.ok ? inline.firstErr : out.err;
-              parseQuotaFromMessage(errForMsg);
+              // Pick the bucket most likely responsible: the largest-count
+              // non-envelope bucket in this chunk. If everything is one
+              // verb (the common case for Save/Delete) this is exact.
+              let dominantKey = null, dominantCount = -1;
+              for (const [k, n] of counts) {
+                if (k === 'ExecuteMultiCall') continue;
+                if (n > dominantCount) { dominantCount = n; dominantKey = k; }
+              }
+              parseQuotaFromMessage(errForMsg, dominantKey || 'ExecuteMultiCall');
               const waitMs = Math.floor(parseRetryAfterMs(errForMsg) * Math.pow(1.25, attempt));
               setStatus('Rate limit hit on chunk ' + (idx + 1) + ' / ' + chunks.length +
                         '. Cooling down ' + Math.ceil(waitMs / 1000) + 's and retrying…', 'error');
               await sleep(waitMs);
-              // Keep rateState.events intact — the cooldown is >= windowMs so
-              // they prune naturally on the next awaitCapacity() pass, and
-              // leaving them shields against per-tenant buckets shared with
-              // other tabs that may still be draining the quota.
               attempt++;
               continue;
             }
@@ -506,6 +574,11 @@ geotab.addin.fuelBulkEditor = function () {
     ui.selected.clear();
     ui.unmatchedPreview = [];
     ui.duplicateTargets.clear();
+    ui.matchedTxIds = new Set();
+    ui.changedTxIds = new Set();
+    ui.matchResult = null;
+    ui.lastMatchCounts = null;
+    ui.tableFilter = 'all';
     renderTable();
 
     const myGen = ui.opGen;
@@ -515,6 +588,11 @@ geotab.addin.fuelBulkEditor = function () {
         ui.rows = Array.isArray(rows) ? rows : [];
         applySortAndRender();
         setStatus(ui.rows.length + ' transactions loaded.', 'success');
+        // Workflow: a successful Load advances the user to Step 2 (Review).
+        if (ui.rows.length) {
+          goToStep(2);
+          showToast({ kind: 'success', message: ui.rows.length + ' transactions loaded', durationMs: 3000 });
+        }
       })
       .catch((err) => {
         if (isStale(myGen) || isCancelled(err)) return;
@@ -560,10 +638,22 @@ geotab.addin.fuelBulkEditor = function () {
         comments: r.comments || ''
       };
     });
-    const filtered = q ? arr.filter((d) => {
+    let filtered = q ? arr.filter((d) => {
       return [d.driverName, d.siteName, d.comments, d.cardNumber, d.deviceName]
         .some((v) => String(v).toLowerCase().indexOf(q) !== -1);
     }) : arr;
+    // Apply the chip filter on top of the text search.
+    const tf = ui.tableFilter;
+    if (tf && tf !== 'all') {
+      filtered = filtered.filter((d) => {
+        if (tf === 'matched')    return ui.matchedTxIds.has(d.id);
+        if (tf === 'changed')    return ui.changedTxIds.has(d.id);
+        if (tf === 'duplicates') return (ui.duplicateTargets.get(d.id) || 0) > 1;
+        if (tf === 'pending')    return ui.edited.has(d.id);
+        if (tf === 'unmatched')  return false;  // unmatched rows aren't in ui.rows — see preview path
+        return true;
+      });
+    }
     const dir = ui.sortDir === 'asc' ? 1 : -1;
     const k = ui.sortKey;
     filtered.sort((a, b) => {
@@ -666,9 +756,11 @@ geotab.addin.fuelBulkEditor = function () {
     const unmatchedHtml = unmatchedPreviewRowsHtml();
     if (!rows.length && !unmatchedHtml) {
       tbody.innerHTML = '<tr><td colspan="13" class="addin-empty">No transactions match.</td></tr>';
-      updateBulkButtons();
+      updateActionBar();
       updateSortIndicators();
-      updateLegendStrip();
+      updateFilterChips();
+      updateSavePill();
+      updateStepperState();
       return;
     }
     const html = rows.map((d) => {
@@ -735,71 +827,52 @@ geotab.addin.fuelBulkEditor = function () {
       '</tr>';
     }).join('');
     tbody.innerHTML = unmatchedHtml + html;
-    updateBulkButtons();
+    updateActionBar();
     updateSortIndicators();
-    updateLegendStrip();
+    updateFilterChips();
     updateSummaryTiles();
-    const dirtyCount = ui.edited.size;
-    if (dirtyCount > 0) {
-      setStatus(dirtyCount + ' pending edit(s). Click "Save edits" to commit.');
-      ensureSaveEditsButton();
-    } else {
-      removeSaveEditsButton();
-    }
+    updateSavePill();
+    updateStepperState();
+    updateDupWarning();
   }
 
-  // ── Legend strip ────────────────────────────────────────────────────────
-  // Shown above the table whenever the table has anything non-trivial to
-  // explain (pending edits, unmatched preview rows, duplicate-target warnings).
-  // Anchored to the table wrapper so it scrolls with the toolbar, not the body.
-  function updateLegendStrip() {
-    const wrap = document.querySelector('.addin-table-wrap');
-    if (!wrap) return;
-    let strip = $('ftbe-legend');
-    const dirty = ui.edited.size;
-    const dupes = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
+  // ── Filter-chip row (replaces the old prose legend strip) ───────────────
+  // The chip row + duplicates warning live in the HTML now; this function
+  // keeps their counts and the active-chip styling in sync with state.
+  function updateFilterChips() {
+    const root = document.querySelector('.ftbe-table-filter');
+    if (!root) return;
+    const matched   = ui.matchedTxIds.size;
+    const changed   = ui.changedTxIds.size;
     const unmatched = ui.unmatchedPreview.length;
-    const need = dirty || dupes || unmatched;
-    if (!need) { if (strip) strip.remove(); return; }
-    if (!strip) {
-      strip = document.createElement('div');
-      strip.id = 'ftbe-legend';
-      strip.className = 'addin-legend';
-      wrap.parentNode.insertBefore(strip, wrap);
-    }
-    const parts = [];
-    if (dirty) {
-      parts.push(
-        '<span class="addin-legend__group">' +
-          '<span class="addin-legend__count">' + dirty + ' pending edit' + (dirty === 1 ? '' : 's') + '</span>' +
-          '<span class="addin-legend__sample cell-edit">value <span class="cell-edit__marker">↑</span></span>' +
-          '<span class="addin-legend__hint">amber cell = changed; <b>↑</b>/<b>↓</b> direction; <b>✎</b> text/enum. Hover a cell to see the previous value.</span>' +
-        '</span>'
-      );
-    }
-    if (dupes) {
-      parts.push(
-        '<span class="addin-legend__group addin-legend__group--warn">' +
-          '<span class="addin-legend__count">' + dupes + ' duplicate target' + (dupes === 1 ? '' : 's') + '</span>' +
-          '<span class="addin-legend__hint">Multiple CSV rows matched the same FuelTransaction. Only the last patch will survive.</span>' +
-        '</span>'
-      );
-    }
-    if (unmatched) {
-      parts.push(
-        '<span class="addin-legend__group addin-legend__group--ghost">' +
-          '<span class="addin-legend__count">' + unmatched + ' unmatched CSV row' + (unmatched === 1 ? '' : 's') + '</span>' +
-          '<span class="addin-legend__hint">No existing FuelTransaction matched. Use <b>Force Import…</b> to add them as new records.</span>' +
-          '<button type="button" class="addin-row-btn" id="ftbe-legend-clear-unmatched">Clear preview</button>' +
-        '</span>'
-      );
-    }
-    strip.innerHTML = parts.join('');
-    const clearBtn = $('ftbe-legend-clear-unmatched');
-    if (clearBtn) clearBtn.addEventListener('click', () => {
-      ui.unmatchedPreview = [];
-      renderTable();
+    const dups      = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
+    const pending   = ui.edited.size;
+    const all       = ui.rows.length + unmatched;
+    const counts = { all: all, matched: matched, changed: changed, unmatched: unmatched, duplicates: dups, pending: pending };
+    root.querySelectorAll('.ftbe-chip').forEach((chip) => {
+      const key = chip.getAttribute('data-filter');
+      const n = counts[key] || 0;
+      const span = chip.querySelector('[data-count]');
+      if (span) span.textContent = String(n);
+      chip.setAttribute('data-count', String(n));
+      const active = ui.tableFilter === key;
+      chip.classList.toggle('is-active', active);
+      chip.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
+  }
+  function updateDupWarning() {
+    const el = $('ftbe-dup-warning');
+    if (!el) return;
+    const dups = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
+    if (!dups) { el.hidden = true; return; }
+    el.hidden = false;
+    const c = $('ftbe-dup-warning-count');
+    if (c) c.textContent = String(dups);
+  }
+  function setTableFilter(name) {
+    if (name === ui.tableFilter) return;
+    ui.tableFilter = name || 'all';
+    renderTable();
   }
 
   // ── Zenith summary tiles ────────────────────────────────────────────────
@@ -849,11 +922,24 @@ geotab.addin.fuelBulkEditor = function () {
 
   function applySortAndRender() { renderTable(); }
 
-  function updateBulkButtons() {
-    const has = ui.selected.size > 0;
-    $('ftbe-bulk-edit').disabled = !has;
-    $('ftbe-bulk-delete').disabled = !has;
+  // ── Selection action bar ────────────────────────────────────────────────
+  // Sticky bottom bar. Hidden when nothing is selected; renders count and
+  // the three selection-scoped actions (Bulk edit, Export selected, Delete).
+  function updateActionBar() {
+    const bar = $('ftbe-action-bar');
     const all = $('ftbe-check-all');
+    const has = ui.selected.size > 0;
+    if (bar) {
+      bar.hidden = !has;
+      const c = $('ftbe-sel-count');
+      if (c) c.textContent = String(ui.selected.size);
+      const editBtn = $('ftbe-bulk-edit');
+      const exportBtn = $('ftbe-export-selected');
+      const deleteBtn = $('ftbe-bulk-delete');
+      if (editBtn)   editBtn.disabled   = !has;
+      if (exportBtn) exportBtn.disabled = !has;
+      if (deleteBtn) deleteBtn.disabled = !has;
+    }
     if (all) {
       const total = deriveDisplayRows().length;
       all.checked = total > 0 && ui.selected.size === total;
@@ -861,20 +947,208 @@ geotab.addin.fuelBulkEditor = function () {
     }
   }
 
-  function ensureSaveEditsButton() {
-    if ($('ftbe-save-edits')) return;
-    const btn = document.createElement('button');
-    btn.id = 'ftbe-save-edits';
-    btn.className = 'btn btn--primary';
-    btn.type = 'button';
-    btn.textContent = 'Save edits';
-    btn.addEventListener('click', saveAllEdits);
-    const row = document.querySelector('.addin-toolbar__row--secondary');
-    if (row) row.appendChild(btn);
+  // ── Save-edits pill ─────────────────────────────────────────────────────
+  // Persistent floating action; replaces the dynamically-inserted "Save
+  // edits" button from the old secondary-toolbar row. One click commits
+  // every staged edit — no modal interstitial.
+  function updateSavePill() {
+    const pill = $('ftbe-save-pill');
+    if (!pill) return;
+    const n = ui.edited.size;
+    pill.hidden = n === 0;
+    const c = $('ftbe-save-count');
+    if (c) c.textContent = String(n);
+    const plural = $('ftbe-save-plural');
+    if (plural) plural.textContent = n === 1 ? '' : 's';
   }
-  function removeSaveEditsButton() {
-    const btn = $('ftbe-save-edits');
-    if (btn) btn.remove();
+
+  // ── Stepper ─────────────────────────────────────────────────────────────
+  // Tracks which workflow step is current and whether each step is reachable.
+  // Step 1 is always reachable; Step 2 unlocks when ui.rows has data; Step 3
+  // unlocks when ui.selected has anything (its "panel" is the sticky action
+  // bar, not a separate panel — that's why this function never assigns
+  // is-current to step 3).
+  function goToStep(n) {
+    if (n !== 1 && n !== 2) return;
+    if (n === 2 && !ui.rows.length && !ui.unmatchedPreview.length) return;
+    ui.activeStep = n;
+    document.querySelectorAll('.zen-step-panel').forEach((panel) => {
+      const step = Number(panel.getAttribute('data-step'));
+      panel.classList.toggle('is-current', step === n);
+      panel.classList.toggle('is-collapsed', step !== n && step !== 2);
+      // Step 2 stays in view (with body visible) once unlocked because it's
+      // where the table lives — the user wants to see results regardless of
+      // whether step 1 or step 2 is "the current focus".
+      if (step === 2 && (ui.rows.length || ui.unmatchedPreview.length)) {
+        panel.classList.remove('is-disabled');
+      }
+    });
+    updateStepperState();
+  }
+  function updateStepperState() {
+    const hasData = ui.rows.length > 0 || ui.unmatchedPreview.length > 0;
+    const hasSel  = ui.selected.size > 0;
+    const steps = {
+      1: { reachable: true,    completed: hasData },
+      2: { reachable: hasData, completed: false   },
+      3: { reachable: hasSel,  completed: false   }
+    };
+    document.querySelectorAll('.zen-stepper__step').forEach((li) => {
+      const step = Number(li.getAttribute('data-step'));
+      const s = steps[step];
+      if (!s) return;
+      li.classList.toggle('is-current',  step === ui.activeStep);
+      li.classList.toggle('is-disabled', !s.reachable);
+      li.classList.toggle('is-completed', s.completed && step !== ui.activeStep);
+      const btn = li.querySelector('.zen-stepper__button');
+      if (btn) {
+        btn.disabled = !s.reachable;
+        btn.setAttribute('aria-disabled', s.reachable ? 'false' : 'true');
+      }
+      if (step === ui.activeStep) li.setAttribute('aria-current', 'step');
+      else li.removeAttribute('aria-current');
+    });
+    // Step captions
+    const cap1 = $('ftbe-step1-caption');
+    if (cap1) cap1.textContent = ui.subMode === 'csv'
+      ? 'CSV: ' + (ui.csvFile ? ui.csvFile.name : 'no file chosen')
+      : 'Define filters or pick a CSV';
+    const cap2 = $('ftbe-step2-caption');
+    if (cap2) cap2.textContent = hasData
+      ? (ui.rows.length + ' loaded · ' + ui.selected.size + ' selected')
+      : 'Load data to continue';
+    const cap3 = $('ftbe-step3-caption');
+    if (cap3) cap3.textContent = hasSel
+      ? (ui.selected.size + ' selected — use the action bar below')
+      : 'Select rows to enable';
+    const sum2 = $('ftbe-step2-summary');
+    if (sum2) sum2.textContent = hasData
+      ? (ui.rows.length + ' transaction' + (ui.rows.length === 1 ? '' : 's'))
+      : 'Load data to continue';
+  }
+
+  // ── Sub-mode (Step 1 segmented control) ─────────────────────────────────
+  function setSubMode(mode) {
+    if (mode !== 'filters' && mode !== 'csv') return;
+    ui.subMode = mode;
+    document.querySelectorAll('.zen-segmented__option').forEach((opt) => {
+      const active = opt.getAttribute('data-mode') === mode;
+      opt.classList.toggle('is-active', active);
+      opt.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    const filters = $('ftbe-mode-filters');
+    const csv = $('ftbe-mode-csv');
+    if (filters) filters.hidden = mode !== 'filters';
+    if (csv)     csv.hidden     = mode !== 'csv';
+    updateRunButtonLabel();
+    updateStepperState();
+  }
+  function updateRunButtonLabel() {
+    const btn = $('ftbe-run');
+    if (!btn) return;
+    if (ui.subMode === 'filters') {
+      btn.textContent = 'Load transactions';
+    } else {
+      const act = ui.csvAction;
+      btn.textContent = act === 'stage' ? 'Match + stage edits'
+                      : act === 'force' ? 'Add CSV rows as new'
+                      : 'Match against CSV';
+    }
+    // Mark destructive Run when in force mode
+    btn.classList.toggle('btn--danger', ui.subMode === 'csv' && ui.csvAction === 'force');
+    btn.classList.toggle('btn--primary', !(ui.subMode === 'csv' && ui.csvAction === 'force'));
+  }
+
+  // ── Suggested next steps + Step 2 review strip ──────────────────────────
+  // Called after a CSV match completes. Populates the "Suggested next steps"
+  // strip and shows a transient toast. Replaces the old modal entirely.
+  function enterReviewStep(result, mode) {
+    ui.matchResult = result || null;
+    ui.matchedTxIds = new Set();
+    ui.changedTxIds = new Set();
+    if (result && Array.isArray(result.matched)) {
+      result.matched.forEach((m) => {
+        if (m.tx && m.tx.id) {
+          ui.matchedTxIds.add(m.tx.id);
+          if (m.changes && m.changes.length) ui.changedTxIds.add(m.tx.id);
+        }
+      });
+    }
+    // Populate suggested actions
+    const s = $('ftbe-suggested');
+    const matched = ui.matchedTxIds.size;
+    const changed = ui.changedTxIds.size;
+    const unmatched = ui.unmatchedPreview.length;
+    const stageBtn  = $('ftbe-suggest-stage');
+    const deleteBtn = $('ftbe-suggest-delete');
+    const addBtn    = $('ftbe-suggest-add');
+    if (stageBtn)  { stageBtn.hidden  = !(mode === 'match-only' && changed > 0); setCountSpan(stageBtn, changed); }
+    if (deleteBtn) { deleteBtn.hidden = matched === 0;                            setCountSpan(deleteBtn, matched); }
+    if (addBtn)    { addBtn.hidden    = unmatched === 0;                          setCountSpan(addBtn, unmatched); }
+    if (s) s.hidden = (matched === 0 && unmatched === 0);
+
+    goToStep(2);
+    const parts = [];
+    if (matched)   parts.push(matched + ' matched');
+    if (changed)   parts.push(changed + ' with changes');
+    if (unmatched) parts.push(unmatched + ' unmatched');
+    showToast({
+      kind: matched ? 'success' : 'error',
+      message: 'CSV ' + (mode === 'match-only' ? 'match' : mode === 'force-add' ? 'force-add' : 'match + stage') + ' complete · ' + (parts.join(' · ') || 'no results'),
+      durationMs: 4000
+    });
+    renderTable();
+  }
+  function setCountSpan(btn, n) {
+    const span = btn.querySelector('[data-count]');
+    if (span) span.textContent = String(n);
+  }
+
+  // ── Toast ───────────────────────────────────────────────────────────────
+  function showToast(opts) {
+    const host = $('ftbe-toast-host');
+    if (!host) return;
+    opts = opts || {};
+    const el = document.createElement('div');
+    el.className = 'ftbe-toast' + (opts.kind ? ' ftbe-toast--' + opts.kind : '');
+    el.setAttribute('role', opts.kind === 'error' ? 'alert' : 'status');
+    el.textContent = opts.message || '';
+    if (opts.actionLabel && typeof opts.onAction === 'function') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ftbe-toast__action';
+      btn.textContent = opts.actionLabel;
+      btn.addEventListener('click', () => { try { opts.onAction(); } finally { el.remove(); } });
+      el.appendChild(btn);
+    }
+    host.appendChild(el);
+    const ms = typeof opts.durationMs === 'number' ? opts.durationMs : 4000;
+    if (ms > 0) setTimeout(() => { if (el.parentNode) el.remove(); }, ms);
+  }
+
+  // ── Export subset CSV (for the duplicate-export action) ─────────────────
+  // Reuses the existing exportCsv path but constrained to a row predicate.
+  function exportDuplicateRows() {
+    const dupIds = new Set(
+      Array.from(ui.duplicateTargets.entries())
+        .filter(([, n]) => n > 1)
+        .map(([id]) => id)
+    );
+    if (!dupIds.size) { setStatus('No duplicate-target rows to export.', 'error'); return; }
+    // Stash + restore selection so we can reuse exportCsv (which exports the
+    // selection when one exists). Cleaner than duplicating exportCsv's body.
+    const prev = ui.selected;
+    ui.selected = dupIds;
+    try { exportCsv(); } finally { ui.selected = prev; }
+  }
+
+  // ── Discard all pending edits ───────────────────────────────────────────
+  function discardAllEdits() {
+    if (!ui.edited.size) return;
+    if (!confirm('Discard ' + ui.edited.size + ' pending edit(s)?')) return;
+    ui.edited.clear();
+    renderTable();
+    setStatus('Pending edits discarded.');
   }
 
   // ── Validation ───────────────────────────────────────────────────────────
@@ -1601,8 +1875,8 @@ geotab.addin.fuelBulkEditor = function () {
         unmatched: result.unmatched.length,
         ambiguous: result.ambiguous.length
       };
-      renderTable();
-      showExternalMatchSummary(result, mode);
+      // Step 2 review strip + toast replace the old modal summary entirely.
+      enterReviewStep(result, mode);
     };
 
     const myGen = ui.opGen;
@@ -1902,35 +2176,167 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── Wiring ───────────────────────────────────────────────────────────────
+  // One Run button dispatches by sub-mode. CSV file is provided by either
+  // the file picker or drag-and-drop on the drop zone. Stepper buttons jump
+  // the user between Query and Review.
   function bindControls() {
-    $('ftbe-load').addEventListener('click', loadTransactions);
-    $('ftbe-export-csv').addEventListener('click', exportCsv);
-    $('ftbe-import-csv').addEventListener('click', () => $('ftbe-file').click());
-    $('ftbe-file').addEventListener('change', (e) => {
-      const f = e.target.files && e.target.files[0];
-      onImportFileChosen(f, 'stage-edits');
-      e.target.value = '';
+    // ── Stepper ────────────────────────────────────────────────────────
+    document.querySelectorAll('.zen-stepper__button[data-step-target]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const n = Number(btn.getAttribute('data-step-target'));
+        if (n) goToStep(n);
+      });
     });
-    $('ftbe-match-csv').addEventListener('click', () => $('ftbe-file-match').click());
-    $('ftbe-file-match').addEventListener('change', (e) => {
-      const f = e.target.files && e.target.files[0];
-      onImportFileChosen(f, 'match-only');
-      e.target.value = '';
+    document.querySelectorAll('.zen-step-panel__strip-toggle').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const panel = btn.closest('.zen-step-panel');
+        if (!panel) return;
+        const collapsed = panel.classList.toggle('is-collapsed');
+        btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      });
     });
-    $('ftbe-force-import').addEventListener('click', () => $('ftbe-file-force').click());
-    $('ftbe-file-force').addEventListener('change', (e) => {
-      const f = e.target.files && e.target.files[0];
-      onImportFileChosen(f, 'force-add');
-      e.target.value = '';
+
+    // ── Sub-mode segmented control ─────────────────────────────────────
+    document.querySelectorAll('.zen-segmented__option[data-mode]').forEach((opt) => {
+      opt.addEventListener('click', () => setSubMode(opt.getAttribute('data-mode')));
     });
+
+    // ── CSV action radio cards ─────────────────────────────────────────
+    document.querySelectorAll('input[name="ftbe-csv-action"]').forEach((r) => {
+      r.addEventListener('change', () => {
+        if (r.checked) { ui.csvAction = r.value; updateRunButtonLabel(); }
+      });
+    });
+
+    // ── CSV drop zone + picker ─────────────────────────────────────────
+    const drop = $('ftbe-csv-drop');
+    const fileEl = $('ftbe-file');
+    const pickBtn = $('ftbe-csv-pick');
+    const nameEl = $('ftbe-csv-filename');
+    function setCsvFile(f) {
+      ui.csvFile = f || null;
+      if (nameEl) {
+        if (f) { nameEl.hidden = false; nameEl.textContent = '✓ ' + f.name + ' (' + Math.round(f.size / 1024) + ' KB)'; }
+        else   { nameEl.hidden = true;  nameEl.textContent = ''; }
+      }
+      updateStepperState();
+    }
+    if (pickBtn && fileEl) {
+      pickBtn.addEventListener('click', () => fileEl.click());
+    }
+    if (fileEl) {
+      fileEl.addEventListener('change', (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (f) setCsvFile(f);
+        e.target.value = '';
+      });
+    }
+    if (drop) {
+      ['dragenter', 'dragover'].forEach((evt) => drop.addEventListener(evt, (e) => {
+        e.preventDefault(); drop.classList.add('is-dragover');
+      }));
+      ['dragleave', 'drop'].forEach((evt) => drop.addEventListener(evt, () => {
+        drop.classList.remove('is-dragover');
+      }));
+      drop.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) setCsvFile(f);
+      });
+    }
+
+    // ── Run button (dispatches by sub-mode) ────────────────────────────
+    $('ftbe-run').addEventListener('click', () => {
+      if (ui.subMode === 'filters') {
+        loadTransactions();
+      } else {
+        if (!ui.csvFile) { setStatus('Pick a CSV file first.', 'error'); return; }
+        const csvMode = ui.csvAction === 'stage' ? 'stage-edits'
+                       : ui.csvAction === 'force' ? 'force-add'
+                       : 'match-only';
+        if (ui.csvAction === 'force') {
+          if (!confirm('Add every row of "' + ui.csvFile.name + '" as a NEW FuelTransaction? This bypasses the matcher and cannot be auto-undone.')) return;
+        }
+        onImportFileChosen(ui.csvFile, csvMode);
+      }
+    });
+
+    // ── Export buttons ─────────────────────────────────────────────────
+    $('ftbe-export-csv').addEventListener('click', () => {
+      // Export full current table (not just selection) — clear selection
+      // before delegating so exportCsv's "selected first" branch doesn't
+      // narrow the export.
+      const prev = ui.selected;
+      ui.selected = new Set();
+      try { exportCsv(); } finally { ui.selected = prev; }
+    });
+    const expSel = $('ftbe-export-selected');
+    if (expSel) expSel.addEventListener('click', exportCsv);
+
+    // ── Search + unit toggles (still in Step 1 filters mode) ───────────
     $('ftbe-search').addEventListener('input', () => renderTable());
     $('ftbe-vol-unit').addEventListener('change', (e) => { ui.volUnit = e.target.value; renderTable(); });
     $('ftbe-odo-unit').addEventListener('change', (e) => { ui.odoUnit = e.target.value; renderTable(); });
 
+    // ── Selection action bar ───────────────────────────────────────────
     $('ftbe-bulk-edit').addEventListener('click', openBulkEditModal);
     $('ftbe-bulk-delete').addEventListener('click', () => deleteRows(Array.from(ui.selected)));
+    const selClear = $('ftbe-sel-clear');
+    if (selClear) selClear.addEventListener('click', () => { ui.selected.clear(); renderTable(); });
 
-    // Sort headers
+    // ── Save-edits pill ────────────────────────────────────────────────
+    const saveBtn = $('ftbe-save-edits');
+    if (saveBtn) saveBtn.addEventListener('click', saveAllEdits);
+    const discardBtn = $('ftbe-discard-edits');
+    if (discardBtn) discardBtn.addEventListener('click', discardAllEdits);
+
+    // ── Filter chips ───────────────────────────────────────────────────
+    document.querySelectorAll('.ftbe-chip[data-filter]').forEach((chip) => {
+      chip.addEventListener('click', () => setTableFilter(chip.getAttribute('data-filter')));
+    });
+    const helpBtn = $('ftbe-legend-help');
+    if (helpBtn) helpBtn.addEventListener('click', () => showToast({
+      message: 'Amber cell = pending edit · ↑/↓ = numeric direction · ✎ = text/enum change. Hover any cell to see the previous value.',
+      durationMs: 8000
+    }));
+
+    // ── Duplicates inline warning ──────────────────────────────────────
+    const dupReview = $('ftbe-dup-review');
+    if (dupReview) dupReview.addEventListener('click', () => setTableFilter('duplicates'));
+    const dupExport = $('ftbe-dup-export');
+    if (dupExport) dupExport.addEventListener('click', exportDuplicateRows);
+
+    // ── Suggested next steps ───────────────────────────────────────────
+    const stageBtn = $('ftbe-suggest-stage');
+    if (stageBtn) stageBtn.addEventListener('click', () => {
+      // Promote each matched-with-changes record into ui.edited and re-render.
+      const r = ui.matchResult; if (!r) return;
+      r.matched.forEach((m) => {
+        if (m.changes && m.changes.length) {
+          const patch = {};
+          m.changes.forEach((c) => { patch[c.field] = c.newVal; });
+          const existing = ui.edited.get(m.tx.id) || {};
+          ui.edited.set(m.tx.id, Object.assign({}, existing, patch));
+        }
+      });
+      renderTable();
+      showToast({ kind: 'success', message: 'Staged ' + ui.edited.size + ' edits. Click Save to commit.' });
+    });
+    const sugDelete = $('ftbe-suggest-delete');
+    if (sugDelete) sugDelete.addEventListener('click', () => {
+      const ids = Array.from(ui.matchedTxIds);
+      deleteRows(ids);
+    });
+    const sugAdd = $('ftbe-suggest-add');
+    if (sugAdd) sugAdd.addEventListener('click', () => {
+      if (!ui.csvFile) { setStatus('CSV file no longer in memory — re-pick to force-add.', 'error'); return; }
+      if (!confirm('Add ' + ui.unmatchedPreview.length + ' unmatched row(s) as NEW FuelTransactions?')) return;
+      onImportFileChosen(ui.csvFile, 'force-add');
+    });
+    const sugDismiss = $('ftbe-suggest-dismiss');
+    if (sugDismiss) sugDismiss.addEventListener('click', () => { const s = $('ftbe-suggested'); if (s) s.hidden = true; });
+
+    // ── Sort headers ───────────────────────────────────────────────────
     document.querySelectorAll('#ftbe-table thead th[data-sort]').forEach((th) => {
       th.addEventListener('click', () => {
         const k = th.getAttribute('data-sort');
@@ -1940,7 +2346,7 @@ geotab.addin.fuelBulkEditor = function () {
       });
     });
 
-    // Select all
+    // ── Select-all ─────────────────────────────────────────────────────
     $('ftbe-check-all').addEventListener('change', (e) => {
       const rows = deriveDisplayRows();
       if (e.target.checked) rows.forEach((r) => ui.selected.add(r.id));
@@ -1948,25 +2354,22 @@ geotab.addin.fuelBulkEditor = function () {
       renderTable();
     });
 
-    // Delegated tbody handler — survives re-renders.
+    // ── Delegated tbody handler ────────────────────────────────────────
     $('ftbe-tbody').addEventListener('click', (e) => {
-      // Unmatched-CSV preview rows: only support "Dismiss" (they have no id).
       const pendingTr = e.target.closest('tr.is-unmatched-preview');
       if (pendingTr && e.target.matches('button[data-action="dismiss-pending"]')) {
         const idx = Number(e.target.getAttribute('data-pending-idx'));
-        if (isFinite(idx)) {
-          ui.unmatchedPreview.splice(idx, 1);
-          renderTable();
-        }
+        if (isFinite(idx)) { ui.unmatchedPreview.splice(idx, 1); renderTable(); }
         return;
       }
-      if (pendingTr) return;   // ignore other clicks inside ghost rows
+      if (pendingTr) return;
       const tr = e.target.closest('tr[data-id]');
       if (!tr) return;
       const id = tr.getAttribute('data-id');
       if (e.target.classList && e.target.classList.contains('ftbe-row-check')) {
         if (e.target.checked) ui.selected.add(id); else ui.selected.delete(id);
-        updateBulkButtons();
+        updateActionBar();
+        updateSummaryTiles();
         tr.classList.toggle('is-selected', e.target.checked);
         return;
       }
@@ -1978,13 +2381,18 @@ geotab.addin.fuelBulkEditor = function () {
       }
     });
 
-    // Modal close handlers
+    // ── Modal close ────────────────────────────────────────────────────
     document.querySelectorAll('#ftbe-modal [data-modal-close]').forEach((el) => {
       el.addEventListener('click', hideModal);
     });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && !$('ftbe-modal').hidden) hideModal();
     });
+
+    // Prime UI for the initial state.
+    setSubMode(ui.subMode);
+    updateRunButtonLabel();
+    updateStepperState();
   }
 
   // ── Public lifecycle ─────────────────────────────────────────────────────
