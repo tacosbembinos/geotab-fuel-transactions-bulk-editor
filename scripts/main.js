@@ -30,8 +30,8 @@ geotab.addin.fuelBulkEditor = function () {
   // we need to wait. Bigger chunks just trade one round-trip for a 60s stall.
   const MULTICALL_CHUNK = 100;
   const RESULTS_LIMIT   = 50000;          // matches official fuel-tracker-edit
-  const L_PER_GAL_US    = 3.785411784;
-  const KM_PER_MI       = 1.609344;
+  // Unit conversion + format helpers live in scripts/units.js (window.FTBE_Units).
+  // The wrappers below preserve existing call signatures.
 
   // Geotab rate limits are tracked per (method, entity, username, database) —
   // see https://developers.geotab.com/myGeotab/guides/rateLimits/index.html.
@@ -493,27 +493,20 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── Unit + format helpers ────────────────────────────────────────────────
-  function fromDisplayVolume(v) { return ui.volUnit === 'gal' ? v * L_PER_GAL_US : v; }
-  function toDisplayVolume(v)   { return ui.volUnit === 'gal' ? v / L_PER_GAL_US : v; }
-  function fromDisplayOdo(v)    { return ui.odoUnit === 'mi'  ? v * KM_PER_MI    : v; }
-  function toDisplayOdo(v)      { return ui.odoUnit === 'mi'  ? v / KM_PER_MI    : v; }
-  function fmtNum(v, digits)    { return v == null || isNaN(v) ? '' : Number(v).toFixed(digits != null ? digits : 2); }
-  function fmtDateTime(iso) {
-    if (!iso) return '';
-    try { return new Date(iso).toLocaleString(); } catch (_) { return String(iso); }
-  }
-  function isoToLocalInput(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    const pad = (n) => String(n).padStart(2, '0');
-    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
-           'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-  }
-  function localInputToIso(s) {
-    if (!s) return null;
-    const d = new Date(s);
-    return isNaN(d) ? null : d.toISOString();
-  }
+  // Implementations live in scripts/units.js (window.FTBE_Units). These thin
+  // wrappers bind the current display unit from `ui` so call sites stay
+  // unchanged. Behavior is identical to the inlined versions; PR-3+ will
+  // extend the underlying module (TZ-aware date parsing, profile-driven
+  // defaults) without further changes here.
+  const _U = (typeof window !== 'undefined' && window.FTBE_Units) || null;
+  function fromDisplayVolume(v) { return _U.fromDisplayVolume(v, ui.volUnit); }
+  function toDisplayVolume(v)   { return _U.toDisplayVolume(v,   ui.volUnit); }
+  function fromDisplayOdo(v)    { return _U.fromDisplayOdo(v,    ui.odoUnit); }
+  function toDisplayOdo(v)      { return _U.toDisplayOdo(v,      ui.odoUnit); }
+  function fmtNum(v, digits)    { return _U.fmtNum(v, digits); }
+  function fmtDateTime(iso)     { return _U.fmtDateTime(iso); }
+  function isoToLocalInput(iso) { return _U.isoToLocalInput(iso); }
+  function localInputToIso(s)   { return _U.localInputToIso(s); }
 
   // ── Reference data loaders ───────────────────────────────────────────────
   function loadReferenceData() {
