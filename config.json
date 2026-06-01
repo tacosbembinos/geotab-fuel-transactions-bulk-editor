@@ -1,13 +1,13 @@
 {
   "name": "Fuel Transactions Bulk Editor",
   "supportEmail": "abembridge@advtracking.net",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "items": [
     {
-      "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.5.1/fuelBulkEditor.html",
+      "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.0/fuelBulkEditor.html",
       "path": "SustainabilityId/",
       "menuName": { "en": "Fuel Transactions Bulk Editor" },
-      "icon": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.5.1/images/icon.svg",
+      "icon": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.0/images/icon.svg",
       "menuHeader": false,
       "securityIds": []
     }

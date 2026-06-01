@@ -113,7 +113,14 @@ geotab.addin.fuelBulkEditor = function () {
       tzMode: 'browser',      // 'browser' | 'utc' | 'iana'
       tzIana: '',             // IANA zone name when tzMode === 'iana'
       toleranceMinutes: 5     // VIN/Serial/Plate match window
-    }
+    },
+    // PR-5 — populated by loadUserProfile() from the Geotab User object.
+    // null until the fetch lands. Display-only: never used to mutate
+    // canonical storage on Get/Set.
+    userProfile: null,
+    userTouchedUnits: false   // flips on the first manual toggle so the
+                              // profile loader doesn't clobber an
+                              // explicit pick made before it returned.
   };
 
   // Cancellation contract:
@@ -536,6 +543,60 @@ geotab.addin.fuelBulkEditor = function () {
     let zone = '';
     try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { zone = ''; }
     el.textContent = zone || 'your browser timezone';
+  }
+
+  // ── User profile (PR-5) ──────────────────────────────────────────────────
+  // Read the logged-in user's measurement preference, timezone, and display
+  // currency so the add-in's defaults match MyGeotab's native UX. Display
+  // only — canonical storage is always L / km / UTC. Best-effort: a failure
+  // (network blip, restricted security clearance) is logged and the
+  // pre-existing hard-coded defaults stand.
+  function loadUserProfile() {
+    const myGen = ui.opGen;
+    const userName = (state && state.userName) || null;
+    if (!api || !userName) return Promise.resolve(null);
+    return apiMultiCall(
+      [['Get', { typeName: 'User', search: { name: userName } }]],
+      { gen: myGen }
+    ).then((results) => {
+      if (isStale(myGen)) return null;
+      const arr = results && results[0];
+      if (!arr || arr.__cancelled || arr.__error || !Array.isArray(arr) || !arr.length) return null;
+      const u = arr[0] || {};
+      ui.userProfile = {
+        isMetric:        u.isMetric !== undefined ? !!u.isMetric : null,
+        timeZoneId:      u.timeZoneId || '',
+        displayCurrency: u.displayCurrency || ''
+      };
+      applyUserProfileDefaults();
+      return ui.userProfile;
+    }).catch((err) => {
+      if (isCancelled(err)) return null;
+      console.warn('[fuelBulkEditor] user profile load failed', err);
+      return null;
+    });
+  }
+
+  // Apply the loaded profile to the unit toggles and TZ chip — but only
+  // if the user hasn't already touched them this session. The dirty-flag
+  // (ui.userTouchedUnits) flips on the first change-event on either
+  // toggle so we don't overwrite an explicit pick on every focus().
+  function applyUserProfileDefaults() {
+    const p = ui.userProfile;
+    if (!p) return;
+    if (!ui.userTouchedUnits && p.isMetric === false) {
+      ui.volUnit = 'gal';
+      ui.odoUnit = 'mi';
+      const vSel = $('ftbe-vol-unit'); if (vSel) vSel.value = 'gal';
+      const oSel = $('ftbe-odo-unit'); if (oSel) oSel.value = 'mi';
+      refreshUnitHeaders();
+    }
+    if (p.timeZoneId) {
+      ui.csvImport.tzMode = 'iana';
+      ui.csvImport.tzIana = p.timeZoneId;
+      const chipEl = $('ftbe-tz-chip-zone');
+      if (chipEl) chipEl.textContent = p.timeZoneId;
+    }
   }
 
   // ── Reference data loaders ───────────────────────────────────────────────
@@ -2856,8 +2917,8 @@ geotab.addin.fuelBulkEditor = function () {
 
     // ── Search + unit toggles (still in Step 1 filters mode) ───────────
     $('ftbe-search').addEventListener('input', () => renderTable());
-    $('ftbe-vol-unit').addEventListener('change', (e) => { ui.volUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
-    $('ftbe-odo-unit').addEventListener('change', (e) => { ui.odoUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
+    $('ftbe-vol-unit').addEventListener('change', (e) => { ui.userTouchedUnits = true; ui.volUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
+    $('ftbe-odo-unit').addEventListener('change', (e) => { ui.userTouchedUnits = true; ui.odoUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
 
     // ── Selection action bar ───────────────────────────────────────────
     $('ftbe-bulk-edit').addEventListener('click', openBulkEditModal);
@@ -3048,6 +3109,9 @@ geotab.addin.fuelBulkEditor = function () {
         }
         // Reference data: best-effort; failure should not block load button.
         try { loadReferenceData(); } catch (e) { console.warn(e); }
+        // User profile (PR-5): best-effort; applies isMetric / timeZoneId
+        // as defaults if the user hasn't already changed them.
+        try { loadUserProfile(); } catch (e) { console.warn(e); }
       } catch (err) {
         console.error('[fuelBulkEditor] initialize failed', err);
       }
