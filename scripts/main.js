@@ -1028,8 +1028,10 @@ geotab.addin.fuelBulkEditor = function () {
       updateActionBar();
       updateSortIndicators();
       updateFilterChips();
+      updateSummaryTiles();
       updateSavePill();
       updateStepperState();
+      updateDupWarning();
       return;
     }
     renderVirtualWindow(unmatchedHtml);
