@@ -508,6 +508,23 @@ geotab.addin.fuelBulkEditor = function () {
   function isoToLocalInput(iso) { return _U.isoToLocalInput(iso); }
   function localInputToIso(s)   { return _U.localInputToIso(s); }
 
+  // Display-unit affordances — keep table headers and the TZ chip honest
+  // about what units / timezone the user is actually looking at. Called on
+  // init and on every volUnit/odoUnit toggle. Cheap; no need to debounce.
+  function refreshUnitHeaders() {
+    const thVol = $('ftbe-th-volume');
+    const thOdo = $('ftbe-th-odometer');
+    if (thVol) thVol.textContent = 'Volume (' + ui.volUnit + ')';
+    if (thOdo) thOdo.textContent = 'Odometer (' + ui.odoUnit + ')';
+  }
+  function refreshTzChip() {
+    const el = $('ftbe-tz-chip-zone');
+    if (!el) return;
+    let zone = '';
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { zone = ''; }
+    el.textContent = zone || 'your browser timezone';
+  }
+
   // ── Reference data loaders ───────────────────────────────────────────────
   function loadReferenceData() {
     const calls = [
@@ -951,7 +968,7 @@ geotab.addin.fuelBulkEditor = function () {
     const volCell  = diffCell(d.volume, patch.volume != null ? newVol : null,
                               newVol != null ? fmtNum(toDisplayVolume(newVol), 3) : '',
                               { numeric: true,
-                                displayOld: d.volume != null ? fmtNum(toDisplayVolume(d.volume), 3) + ' ' + ui.volUnit : '(empty)' });
+                                displayOld: d.volume != null ? fmtNum(toDisplayVolume(d.volume), 3) : '(empty)' });
     const costCell = diffCell(d.cost, patch.cost != null ? newCost : null,
                               newCost != null ? fmtNum(newCost, 2) : '',
                               { numeric: true });
@@ -959,7 +976,7 @@ geotab.addin.fuelBulkEditor = function () {
     const odoCell  = diffCell(d.odometer, patch.odometer != null ? newOdo : null,
                               newOdo != null ? fmtNum(toDisplayOdo(newOdo), 0) : '',
                               { numeric: true,
-                                displayOld: d.odometer != null ? fmtNum(toDisplayOdo(d.odometer), 0) + ' ' + ui.odoUnit : '(empty)' });
+                                displayOld: d.odometer != null ? fmtNum(toDisplayOdo(d.odometer), 0) : '(empty)' });
     const cmtCell  = diffCell(d.comments, patch.comments != null ? newCmt : null, newCmt || '');
 
     const rowClasses = ['ftbe-row'];
@@ -2617,8 +2634,8 @@ geotab.addin.fuelBulkEditor = function () {
 
     // ── Search + unit toggles (still in Step 1 filters mode) ───────────
     $('ftbe-search').addEventListener('input', () => renderTable());
-    $('ftbe-vol-unit').addEventListener('change', (e) => { ui.volUnit = e.target.value; renderTable(); });
-    $('ftbe-odo-unit').addEventListener('change', (e) => { ui.odoUnit = e.target.value; renderTable(); });
+    $('ftbe-vol-unit').addEventListener('change', (e) => { ui.volUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
+    $('ftbe-odo-unit').addEventListener('change', (e) => { ui.odoUnit = e.target.value; refreshUnitHeaders(); renderTable(); });
 
     // ── Selection action bar ───────────────────────────────────────────
     $('ftbe-bulk-edit').addEventListener('click', openBulkEditModal);
@@ -2801,6 +2818,8 @@ geotab.addin.fuelBulkEditor = function () {
         if (!ui.initialized) {
           bindControls();
           setDefaultDateRange();
+          refreshUnitHeaders();
+          refreshTzChip();
           ui.initialized = true;
         }
         // Reference data: best-effort; failure should not block load button.

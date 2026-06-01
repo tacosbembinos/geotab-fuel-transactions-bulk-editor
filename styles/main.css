@@ -1338,6 +1338,27 @@
   from { transform: translateY(8px); opacity: 0; }
   to   { transform: translateY(0);   opacity: 1; }
 }
+
+/* ── Timezone chip ──────────────────────────────────────────────────
+   Sits under the From/To pickers in the Filter Search panel to make
+   the implicit "browser local → stored as UTC" round-trip visible.
+   Spans the full filter grid row so it reads as a footnote, not a
+   field. */
+.addin-root .ftbe-tz-chip {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--zen-space-1);
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 0.85em;
+  color: var(--zen-text-secondary);
+  background: var(--zen-backgrounds-content-1);
+  border: 1px solid var(--zen-borders-general);
+  border-radius: 6px;
+}
+.addin-root .ftbe-tz-chip__icon { line-height: 1; }
+.addin-root .ftbe-tz-chip strong { color: var(--zen-text-primary); font-weight: 600; }
 @media (prefers-reduced-motion: reduce) {
   .addin-root .ftbe-action-bar { animation: none; }
   .addin-root .zen-step-panel__chevron { transition: none; }
