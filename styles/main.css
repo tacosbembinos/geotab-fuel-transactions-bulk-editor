@@ -1276,6 +1276,13 @@
 .addin-root .ftbe-chip.is-active span[data-count] {
   color: var(--zen-borders-form-field--active);
 }
+.addin-root .ftbe-csv-reconcile {
+  font-size: var(--zen-font-sm);
+  color: var(--zen-text-secondary);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+  padding: 0 var(--zen-space-2);
+}
 
 /* ── INLINE WARNING (duplicates) ─────────────────────────────────────── */
 .addin-root .ftbe-inline-warning {

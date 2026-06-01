@@ -1130,6 +1130,7 @@ geotab.addin.fuelBulkEditor = function () {
       updateSavePill();
       updateStepperState();
       updateDupWarning();
+    updateCsvReconcile();
       return;
     }
     renderVirtualWindow(unmatchedHtml);
@@ -1140,6 +1141,7 @@ geotab.addin.fuelBulkEditor = function () {
     updateSavePill();
     updateStepperState();
     updateDupWarning();
+    updateCsvReconcile();
   }
 
   // Re-renders the visible-row window inside <tbody>. Called by renderTable
@@ -1227,6 +1229,10 @@ geotab.addin.fuelBulkEditor = function () {
     const unmatched = ui.unmatchedPreview.length;
     const dups      = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
     const pending   = ui.edited.size;
+    // "All" is the count of rows the table renders (loaded txns + pinned
+    // unmatched CSV preview rows). Previously this was advertised as a single
+    // total, which made (Loaded + Unmatched) look like a math identity tied
+    // to the CSV row count — it isn't. Treat it strictly as "rows in view".
     const all       = ui.rows.length + unmatched;
     const counts = { all: all, matched: matched, changed: changed, unmatched: unmatched, duplicates: dups, pending: pending };
     root.querySelectorAll('.ftbe-chip').forEach((chip) => {
@@ -1240,14 +1246,38 @@ geotab.addin.fuelBulkEditor = function () {
       chip.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
   }
+  function updateCsvReconcile() {
+    const el = $('ftbe-csv-reconcile');
+    if (!el) return;
+    const m = ui.lastMatchCounts;
+    if (!m) { el.hidden = true; el.textContent = ''; return; }
+    const csvTotal = (m.matched || 0) + (m.unmatched || 0) + (m.ambiguous || 0);
+    const uniqueMatchedTx = ui.matchedTxIds.size;
+    const collapsed = (m.matched || 0) - uniqueMatchedTx;
+    el.hidden = false;
+    let text = 'CSV: ' + csvTotal + ' row' + (csvTotal === 1 ? '' : 's') +
+               ' → ' + (m.matched || 0) + ' matched';
+    if (collapsed > 0) text += ' (collapsed to ' + uniqueMatchedTx + ' unique txns)';
+    text += ' · ' + (m.unmatched || 0) + ' unmatched';
+    if (m.ambiguous) text += ' · ' + m.ambiguous + ' ambiguous';
+    text += ' · Geotab returned ' + ui.rows.length + ' txn' + (ui.rows.length === 1 ? '' : 's');
+    el.textContent = text;
+    el.title = 'CSV row totals reconciled against what Geotab returned. ' +
+               '"All" in the chip row is loaded txns + pinned unmatched preview rows; it is NOT the CSV total.';
+  }
   function updateDupWarning() {
     const el = $('ftbe-dup-warning');
     if (!el) return;
+    if (ui.dupWarningDismissed) { el.hidden = true; return; }
     const dups = Array.from(ui.duplicateTargets.values()).filter((n) => n > 1).length;
     if (!dups) { el.hidden = true; return; }
     el.hidden = false;
     const c = $('ftbe-dup-warning-count');
     if (c) c.textContent = String(dups);
+    // Keep the review-button label in sync with the chip filter so the user
+    // never sees "Review duplicates" when the filter is already on it.
+    const dupReview = $('ftbe-dup-review');
+    if (dupReview) dupReview.textContent = ui.tableFilter === 'duplicates' ? 'Show all rows' : 'Review duplicates';
   }
   function setTableFilter(name) {
     if (name === ui.tableFilter) return;
@@ -1481,9 +1511,14 @@ geotab.addin.fuelBulkEditor = function () {
     if (matched)   parts.push(matched + ' matched');
     if (changed)   parts.push(changed + ' with changes');
     if (unmatched) parts.push(unmatched + ' unmatched');
+    const summary = parts.join(' · ') || 'no results';
+    // Clear the "Fetching FuelTransactions by VIN…" chip — the fetch is done
+    // and the review strip + toast now own the user-facing summary. Without
+    // this clear, the in-progress chip stays pinned in the header forever.
+    setStatus('CSV ' + (mode === 'match-only' ? 'match' : mode === 'force-add' ? 'force-add' : 'match + stage') + ' complete · ' + summary, matched ? 'success' : 'error');
     showToast({
       kind: matched ? 'success' : 'error',
-      message: 'CSV ' + (mode === 'match-only' ? 'match' : mode === 'force-add' ? 'force-add' : 'match + stage') + ' complete · ' + (parts.join(' · ') || 'no results'),
+      message: 'CSV ' + (mode === 'match-only' ? 'match' : mode === 'force-add' ? 'force-add' : 'match + stage') + ' complete · ' + summary,
       durationMs: 4000
     });
     renderTable();
@@ -2407,6 +2442,9 @@ geotab.addin.fuelBulkEditor = function () {
       });
       ui.selected.clear();
       ui.duplicateTargets.clear();
+      // Fresh match — un-dismiss the warning so a new round of duplicates
+      // surfaces again. The dismiss state is intentionally per-match.
+      ui.dupWarningDismissed = false;
       // Track how many CSV rows landed on the same tx — flagged in the table
       // (amber row stripe) AND surfaced as a dedicated warning section in the
       // summary modal, because "last write wins" is silently destructive.
@@ -2944,9 +2982,22 @@ geotab.addin.fuelBulkEditor = function () {
 
     // ── Duplicates inline warning ──────────────────────────────────────
     const dupReview = $('ftbe-dup-review');
-    if (dupReview) dupReview.addEventListener('click', () => setTableFilter('duplicates'));
+    if (dupReview) dupReview.addEventListener('click', () => {
+      // Toggle: a second press returns the table to All so the button is
+      // never a one-way trap. The early-return in setTableFilter() means
+      // re-pressing with the same filter is a no-op — easy to read as
+      // "button broken". Flip back to 'all' instead. The label itself is
+      // kept in sync by updateDupWarning().
+      setTableFilter(ui.tableFilter === 'duplicates' ? 'all' : 'duplicates');
+    });
     const dupExport = $('ftbe-dup-export');
     if (dupExport) dupExport.addEventListener('click', exportDuplicateRows);
+    const dupDismiss = $('ftbe-dup-dismiss');
+    if (dupDismiss) dupDismiss.addEventListener('click', () => {
+      ui.dupWarningDismissed = true;
+      const el = $('ftbe-dup-warning');
+      if (el) el.hidden = true;
+    });
 
     // ── Suggested next steps ───────────────────────────────────────────
     const stageBtn = $('ftbe-suggest-stage');
