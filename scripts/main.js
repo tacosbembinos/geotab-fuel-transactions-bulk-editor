@@ -100,7 +100,20 @@ geotab.addin.fuelBulkEditor = function () {
     matchedTxIds: new Set(),    // tx.ids that came from the last CSV match
     changedTxIds: new Set(),    // tx.ids where the CSV proposed changes
     activeEdit: null,           // { id, field } for the currently-editing inline cell, or null
-    suppressBlurCommit: false   // set briefly when Esc cancels, so the blur handler skips commit
+    suppressBlurCommit: false,  // set briefly when Esc cancels, so the blur handler skips commit
+    // ── CSV import declaration (PR-3) ─────────────────────────────────
+    // Persisted across imports within a session. Defaults to the active
+    // display units (most users have already set the toggles to match
+    // their data) and browser timezone, which matches pre-PR-3 behavior
+    // when accepted unchanged. The user must still confirm the modal —
+    // no silent assumptions.
+    csvImport: {
+      volUnit: 'L',           // 'L' | 'gal'
+      odoUnit: 'km',          // 'km' | 'mi'
+      tzMode: 'browser',      // 'browser' | 'utc' | 'iana'
+      tzIana: '',             // IANA zone name when tzMode === 'iana'
+      toleranceMinutes: 5     // VIN/Serial/Plate match window
+    }
   };
 
   // Cancellation contract:
@@ -737,25 +750,39 @@ geotab.addin.fuelBulkEditor = function () {
     if (!ui.unmatchedPreview.length) return '';
     return ui.unmatchedPreview.map((u, idx) => {
       const csv = u.csvRow || u;
+      const raw = csv._raw || {};
       const reason = u.reason || '';
       const key = csv.vehicleIdentificationNumber || csv.serialNumber || csv.licencePlate || '(no key)';
+      // Display the canonical value with a tooltip showing the original raw
+      // CSV string when conversion happened. Header already carries the unit.
       const dt = csv.dateTime ? fmtDateTime(csv.dateTime) : '';
-      const vol = csv.volume != null && csv.volume !== '' ? csv.volume : '';
+      const dtTitle = raw.dateTime && raw.dateTime !== csv.dateTime
+        ? 'CSV: ' + raw.dateTime + '\n→ stored: ' + csv.dateTime
+        : '';
+      const volNum = csv.volume;
+      const vol = volNum != null && volNum !== '' && isFinite(Number(volNum)) ? fmtNum(toDisplayVolume(Number(volNum)), 3) : (volNum != null ? String(volNum) : '');
+      const volTitle = raw.volume && String(raw.volume) !== String(volNum)
+        ? 'CSV: ' + raw.volume + (ui.csvImport.volUnit === 'gal' ? ' gal' : ' L') +
+          '\n→ stored: ' + (volNum != null ? Number(volNum).toFixed(3) : '') + ' L' : '';
       const cost = csv.cost != null && csv.cost !== '' ? csv.cost : '';
-      const odo = csv.odometer != null && csv.odometer !== '' ? csv.odometer : '';
+      const odoNum = csv.odometer;
+      const odo = odoNum != null && odoNum !== '' && isFinite(Number(odoNum)) ? fmtNum(toDisplayOdo(Number(odoNum)), 0) : (odoNum != null ? String(odoNum) : '');
+      const odoTitle = raw.odometer && String(raw.odometer) !== String(odoNum)
+        ? 'CSV: ' + raw.odometer + (ui.csvImport.odoUnit === 'mi' ? ' mi' : ' km') +
+          '\n→ stored: ' + (odoNum != null ? Number(odoNum).toFixed(0) : '') + ' km' : '';
       const tipParts = ['No existing FuelTransaction matched this CSV row.'];
       if (reason) tipParts.push(reason);
       tipParts.push('To add it as a new record, re-run import with “Force Import…” or use Geotab’s native Fuel Transactions import.');
       const tip = tipParts.join('\n');
       return '<tr class="is-unmatched-preview" data-pending-idx="' + idx + '" title="' + escapeHtml(tip) + '">' +
         '<td class="addin-col-check"><span class="cell-pending-badge" aria-label="Unmatched CSV row">+</span></td>' +
-        '<td>' + escapeHtml(dt) + '</td>' +
+        '<td' + (dtTitle ? ' title="' + escapeHtml(dtTitle) + '"' : '') + '>' + escapeHtml(dt) + '</td>' +
         '<td colspan="2"><span class="cell-pending-label">UNMATCHED · ' + escapeHtml(key) + '</span></td>' +
         '<td>' + escapeHtml(csv.productType || '') + '</td>' +
-        '<td class="addin-col-num">' + escapeHtml(vol) + '</td>' +
+        '<td class="addin-col-num"' + (volTitle ? ' title="' + escapeHtml(volTitle) + '"' : '') + '>' + escapeHtml(vol) + '</td>' +
         '<td class="addin-col-num">' + escapeHtml(cost) + '</td>' +
         '<td>' + escapeHtml(csv.currencyCode || '') + '</td>' +
-        '<td class="addin-col-num">' + escapeHtml(odo) + '</td>' +
+        '<td class="addin-col-num"' + (odoTitle ? ' title="' + escapeHtml(odoTitle) + '"' : '') + '>' + escapeHtml(odo) + '</td>' +
         '<td>' + escapeHtml(csv.siteName || '') + '</td>' +
         '<td>' + escapeHtml(csv.cardNumber || '') + '</td>' +
         '<td><i>' + escapeHtml(reason) + '</i></td>' +
@@ -1746,20 +1773,101 @@ geotab.addin.fuelBulkEditor = function () {
   }
 
   // ── CSV import (bulk-edit upload) ────────────────────────────────────────
-  function onImportFileChosen(file, mode) {
+  // opts (PR-3) carries the explicit unit + timezone + match-tolerance
+  // declaration the user made in the import-options modal. May be omitted
+  // by callers that have already confirmed (e.g. the suggested-action
+  // "Add unmatched as new" button reuses the previous declaration).
+  function onImportFileChosen(file, mode, opts) {
     if (!file) return;
+    const importOpts = opts || ui.csvImport;
     const reader = new FileReader();
     reader.onload = () => {
       try {
         const text = String(reader.result || '');
         const parsed = window.CSVUtil.parse(text);
-        applyImport(parsed, mode);
+        applyImport(parsed, mode, importOpts);
       } catch (err) {
         setStatus('CSV parse failed: ' + (err && err.message ? err.message : err), 'error');
       }
     };
     reader.onerror = () => setStatus('Could not read CSV file.', 'error');
     reader.readAsText(file);
+  }
+
+  // PR-3 entry point. Opens a small modal asking the user to confirm
+  // (a) the volume unit, (b) the odometer unit, (c) the source timezone,
+  // and (d) the VIN/Serial/Plate match window. On Save, persists the
+  // choices to ui.csvImport and proceeds with onImportFileChosen. The
+  // modal seeds defaults from the filter-panel toggles (volUnit/odoUnit)
+  // and the browser's IANA zone, so a user whose toggles already match
+  // their data can confirm without changing anything.
+  function openCsvImportOptionsModal(file, mode) {
+    if (!file) return;
+    const cfg = Object.assign({}, ui.csvImport);
+    // Re-seed unit defaults from the panel toggles every time — they're
+    // the most recent signal of what the user expects to be looking at.
+    cfg.volUnit = ui.volUnit;
+    cfg.odoUnit = ui.odoUnit;
+    let browserZone = '';
+    try { browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) {}
+    const body = $('ftbe-modal-body');
+    body.innerHTML =
+      '<p>Confirm how to interpret <b>' + escapeHtml(file.name) + '</b>. ' +
+        'Geotab stores volume in <b>Liters</b>, odometer in <b>km</b>, and date/time in <b>UTC</b>; ' +
+        'we’ll convert from your CSV’s units before matching.</p>' +
+      '<div class="addin-form-grid">' +
+        '<label class="addin-field"><span>Volume column is in</span>' +
+          '<select id="ftbe-csvopt-volUnit">' +
+            '<option value="L"' + (cfg.volUnit === 'L' ? ' selected' : '') + '>Liters (L)</option>' +
+            '<option value="gal"' + (cfg.volUnit === 'gal' ? ' selected' : '') + '>US Gallons (gal)</option>' +
+          '</select></label>' +
+        '<label class="addin-field"><span>Odometer column is in</span>' +
+          '<select id="ftbe-csvopt-odoUnit">' +
+            '<option value="km"' + (cfg.odoUnit === 'km' ? ' selected' : '') + '>Kilometers (km)</option>' +
+            '<option value="mi"' + (cfg.odoUnit === 'mi' ? ' selected' : '') + '>Miles (mi)</option>' +
+          '</select></label>' +
+        '<label class="addin-field"><span>Date / Time timezone</span>' +
+          '<select id="ftbe-csvopt-tzMode">' +
+            '<option value="browser"' + (cfg.tzMode === 'browser' ? ' selected' : '') +
+              '>Browser local (' + escapeHtml(browserZone || 'detected') + ')</option>' +
+            '<option value="utc"' + (cfg.tzMode === 'utc' ? ' selected' : '') + '>UTC</option>' +
+            '<option value="iana"' + (cfg.tzMode === 'iana' ? ' selected' : '') + '>Specific IANA zone…</option>' +
+          '</select></label>' +
+        '<label class="addin-field" id="ftbe-csvopt-tzIana-field"' +
+            (cfg.tzMode === 'iana' ? '' : ' hidden') + '><span>IANA zone</span>' +
+          '<input type="text" id="ftbe-csvopt-tzIana" placeholder="e.g. America/Toronto" value="' +
+            escapeHtml(cfg.tzIana || browserZone) + '"></label>' +
+        '<label class="addin-field"><span>Match within ± minutes</span>' +
+          '<input type="number" min="0" max="1440" step="1" id="ftbe-csvopt-tol" value="' +
+            escapeHtml(String(cfg.toleranceMinutes || 5)) + '"></label>' +
+      '</div>' +
+      '<p class="addin-import-summary" style="margin-top:8px">' +
+        'Rows whose Date / Time already carries a Z or ±HH:MM offset are honoured as-is, ' +
+        'regardless of the timezone choice.' +
+      '</p>';
+    $('ftbe-modal-title').textContent = 'CSV import options';
+    showModal(() => {
+      const tzMode = $('ftbe-csvopt-tzMode').value;
+      const tzIanaEl = $('ftbe-csvopt-tzIana');
+      const next = {
+        volUnit: $('ftbe-csvopt-volUnit').value === 'gal' ? 'gal' : 'L',
+        odoUnit: $('ftbe-csvopt-odoUnit').value === 'mi'  ? 'mi'  : 'km',
+        tzMode:  tzMode === 'utc' || tzMode === 'iana' ? tzMode : 'browser',
+        tzIana:  (tzIanaEl && tzIanaEl.value || '').trim(),
+        toleranceMinutes: Math.max(0, Math.min(1440, parseInt($('ftbe-csvopt-tol').value, 10) || 5))
+      };
+      if (next.tzMode === 'iana' && !next.tzIana) { next.tzMode = 'browser'; }
+      ui.csvImport = next;
+      onImportFileChosen(file, mode, next);
+    });
+    // Wire conditional IANA-field visibility once the modal is in the DOM.
+    const tzModeEl = $('ftbe-csvopt-tzMode');
+    if (tzModeEl) {
+      tzModeEl.addEventListener('change', () => {
+        const fld = $('ftbe-csvopt-tzIana-field');
+        if (fld) fld.hidden = tzModeEl.value !== 'iana';
+      });
+    }
   }
 
   // External-format header aliases (case-insensitive). Maps third-party
@@ -1805,20 +1913,50 @@ geotab.addin.fuelBulkEditor = function () {
   function stripCommas(s) { return typeof s === 'string' ? s.replace(/,/g, '') : s; }
 
   // Normalises a row from an external CSV into FuelTransaction-shaped fields.
-  function normalizeExternalRow(headers, row) {
+  // opts (PR-3): { volUnit, odoUnit, tzMode, tzIana } — when present, volume
+  // and odometer are converted to canonical units (L, km) and dateTime is
+  // parsed via the chosen timezone. The original raw strings are preserved
+  // on out._raw so the unmatched-preview row renderer can show
+  // "42.5 gal → 160.871 L" without re-parsing.
+  function normalizeExternalRow(headers, row, opts) {
+    const volUnit = (opts && opts.volUnit) || 'L';
+    const odoUnit = (opts && opts.odoUnit) || 'km';
     const out = {};
+    const raw = {};
     for (const h of headers) {
       const key = EXTERNAL_HEADER_ALIASES[h.toLowerCase()];
       if (!key) continue;
       let v = row[h];
       if (v == null || v === '') continue;
-      if (key === 'volume' || key === 'cost' || key === 'odometer') v = stripCommas(v);
+      if (key === 'volume' || key === 'cost' || key === 'odometer') {
+        raw[key] = String(v);
+        v = stripCommas(v);
+        // Strip "12.3 gal" → "12.3" if the user typed the unit inline,
+        // even if their selected unit disagrees — we trust the explicit
+        // numeric value and convert per the selected unit.
+        const bare = _U && _U.stripUnitHint ? _U.stripUnitHint(String(v)) : null;
+        if (bare != null) v = bare;
+        if (key === 'volume') {
+          const num = Number(v);
+          v = isFinite(num) && volUnit === 'gal' ? num * _U.L_PER_GAL_US : num;
+        } else if (key === 'odometer') {
+          const num = Number(v);
+          v = isFinite(num) && odoUnit === 'mi' ? num * _U.KM_PER_MI : num;
+        }
+      }
+      if (key === 'dateTime') {
+        raw.dateTime = String(v);
+        const iso = _U && _U.csvDateToIso ? _U.csvDateToIso(v, opts || {}) : null;
+        if (iso) v = iso;
+        else continue;   // skip unparseable date silently — matcher logs unmatched
+      }
       if (key === 'productType') {
         const syn = PRODUCT_TYPE_SYNONYMS[String(v).toLowerCase()];
         if (syn) v = syn;
       }
       out[key] = v;
     }
+    if (Object.keys(raw).length) out._raw = raw;
     return out;
   }
 
@@ -1942,7 +2080,7 @@ geotab.addin.fuelBulkEditor = function () {
     return (h % 24) ? d + 'd ' + (h % 24) + 'h' : d + 'd';
   }
 
-  function applyImport(parsed, mode) {
+  function applyImport(parsed, mode, opts) {
     if (!parsed || !parsed.headers || !parsed.headers.length) {
       setStatus('CSV appears empty.', 'error'); return;
     }
@@ -1950,8 +2088,8 @@ geotab.addin.fuelBulkEditor = function () {
       setStatus('CSV does not match the Geotab Fuel Transactions Import Template. Need at least one of: Vehicle Identification Number, Serial Number, License Plate.', 'error');
       return;
     }
-    if (mode === 'force-add') return applyForceImport(parsed);
-    return applyExternalImport(parsed, mode || 'stage-edits');
+    if (mode === 'force-add') return applyForceImport(parsed, opts);
+    return applyExternalImport(parsed, mode || 'stage-edits', opts);
   }
 
   // Force Import — Add every CSV row as a NEW FuelTransaction. Bypasses the
@@ -1968,10 +2106,10 @@ geotab.addin.fuelBulkEditor = function () {
   // value for it.
   function buildAddEntity(csvRow) {
     const entity = {};
-    if (csvRow.dateTime) {
-      const d = new Date(csvRow.dateTime);
-      if (!isNaN(d)) entity.dateTime = d.toISOString();
-    }
+    // dateTime is already canonical UTC ISO (set by normalizeExternalRow via
+    // FTBE_Units.csvDateToIso). Trust it; do not re-parse — that would
+    // round-trip through browser-local and undo the user's TZ choice.
+    if (csvRow.dateTime) entity.dateTime = String(csvRow.dateTime);
     const vin    = csvRow.vehicleIdentificationNumber ? String(csvRow.vehicleIdentificationNumber).trim() : '';
     const serial = csvRow.serialNumber ? String(csvRow.serialNumber).trim() : '';
     const plate  = csvRow.licencePlate ? String(csvRow.licencePlate).trim() : '';
@@ -1983,9 +2121,11 @@ geotab.addin.fuelBulkEditor = function () {
     if (csvRow.driverName)  entity.driverName  = String(csvRow.driverName);
     if (csvRow.cardNumber)  entity.cardNumber  = String(csvRow.cardNumber);
 
-    const volNum  = Number(stripCommas(csvRow.volume));
+    // volume/odometer are already in canonical units (L / km). cost has no
+    // unit, so still needs stripCommas in case the CSV preserved them.
+    const volNum  = Number(csvRow.volume);
     const costNum = Number(stripCommas(csvRow.cost));
-    const odoNum  = Number(stripCommas(csvRow.odometer));
+    const odoNum  = Number(csvRow.odometer);
     if (isFinite(volNum)  && volNum  >= 0) entity.volume   = volNum;
     if (isFinite(costNum) && costNum >= 0) entity.cost     = costNum;
     if (isFinite(odoNum)  && odoNum  >= 0) entity.odometer = odoNum;
@@ -2014,9 +2154,9 @@ geotab.addin.fuelBulkEditor = function () {
     return entity;
   }
 
-  function applyForceImport(parsed) {
+  function applyForceImport(parsed, opts) {
     const externals = parsed.rows
-      .map((row) => normalizeExternalRow(parsed.headers, row))
+      .map((row) => normalizeExternalRow(parsed.headers, row, opts))
       .filter((r) => r.vehicleIdentificationNumber || r.serialNumber || r.licencePlate);
     if (!externals.length) {
       setStatus('No usable rows (need VIN, Serial, or Plate on every row).', 'error');
@@ -2098,10 +2238,10 @@ geotab.addin.fuelBulkEditor = function () {
   // mode:
   //   'stage-edits' — stage CSV values as pending edits on matched rows (default)
   //   'match-only'  — just select matched rows; do not touch ui.edited
-  function applyExternalImport(parsed, mode) {
+  function applyExternalImport(parsed, mode, opts) {
     mode = mode || 'stage-edits';
     const externals = parsed.rows
-      .map((row) => normalizeExternalRow(parsed.headers, row))
+      .map((row) => normalizeExternalRow(parsed.headers, row, opts))
       .filter((r) => r.vehicleIdentificationNumber || r.serialNumber || r.licencePlate);
     if (!externals.length) {
       setStatus('No usable rows (need VIN, Serial, or Plate).', 'error'); return;
@@ -2128,7 +2268,9 @@ geotab.addin.fuelBulkEditor = function () {
     const canUseServerVinSearch = uniqueVins.length > 0 && uniqueVins.length <= 100 && needFetch;
 
     const finishMatch = () => {
-      const result = matchExternalRows(externals, ui.rows);
+      const result = matchExternalRows(externals, ui.rows, {
+        toleranceMinutes: (opts && opts.toleranceMinutes) || ui.csvImport.toleranceMinutes || 5
+      });
       ui.selected.clear();
       ui.duplicateTargets.clear();
       // Track how many CSV rows landed on the same tx — flagged in the table
@@ -2616,7 +2758,8 @@ geotab.addin.fuelBulkEditor = function () {
         if (ui.csvAction === 'force') {
           if (!confirm('Add every row of "' + ui.csvFile.name + '" as a NEW FuelTransaction? This bypasses the matcher and cannot be auto-undone.')) return;
         }
-        onImportFileChosen(ui.csvFile, csvMode);
+        // PR-3: route through the unit/TZ/tolerance declaration modal.
+        openCsvImportOptionsModal(ui.csvFile, csvMode);
       }
     });
 
@@ -2690,7 +2833,9 @@ geotab.addin.fuelBulkEditor = function () {
     if (sugAdd) sugAdd.addEventListener('click', () => {
       if (!ui.csvFile) { setStatus('CSV file no longer in memory — re-pick to force-add.', 'error'); return; }
       if (!confirm('Add ' + ui.unmatchedPreview.length + ' unmatched row(s) as NEW FuelTransactions?')) return;
-      onImportFileChosen(ui.csvFile, 'force-add');
+      // Reuse the previously-confirmed declaration — no need to re-prompt
+      // since the user just confirmed it during the match-only pass.
+      onImportFileChosen(ui.csvFile, 'force-add', ui.csvImport);
     });
     const sugDismiss = $('ftbe-suggest-dismiss');
     if (sugDismiss) sugDismiss.addEventListener('click', () => { const s = $('ftbe-suggested'); if (s) s.hidden = true; });
