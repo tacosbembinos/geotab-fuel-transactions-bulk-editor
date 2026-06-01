@@ -253,13 +253,14 @@
              "what am I looking at?" -->
         <div class="ftbe-table-filter" role="toolbar" aria-label="Filter table rows">
           <span class="ftbe-table-filter__label">Showing</span>
-          <button type="button" class="ftbe-chip is-active" data-filter="all"     aria-pressed="true">All <span data-count>0</span></button>
-          <button type="button" class="ftbe-chip"           data-filter="matched"   aria-pressed="false">Matched <span data-count>0</span></button>
-          <button type="button" class="ftbe-chip"           data-filter="changed"   aria-pressed="false">With changes <span data-count>0</span></button>
-          <button type="button" class="ftbe-chip"           data-filter="unmatched" aria-pressed="false">Unmatched <span data-count>0</span></button>
-          <button type="button" class="ftbe-chip"           data-filter="duplicates" aria-pressed="false">Duplicates <span data-count>0</span></button>
-          <button type="button" class="ftbe-chip"           data-filter="pending"   aria-pressed="false">Pending <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip is-active" data-filter="all"     aria-pressed="true" title="Loaded transactions + any pinned unmatched-CSV preview rows. NOT a CSV-row count.">All <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip"           data-filter="matched"   aria-pressed="false" title="Unique FuelTransactions matched by the last CSV import.">Matched <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip"           data-filter="changed"   aria-pressed="false" title="Matched transactions where the CSV proposes ≥1 field change.">With changes <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip"           data-filter="unmatched" aria-pressed="false" title="CSV rows with no matching FuelTransaction.">Unmatched <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip"           data-filter="duplicates" aria-pressed="false" title="Loaded transactions hit by ≥2 CSV rows.">Duplicates <span data-count>0</span></button>
+          <button type="button" class="ftbe-chip"           data-filter="pending"   aria-pressed="false" title="Transactions with pending edits not yet saved.">Pending <span data-count>0</span></button>
           <span class="addin-spacer"></span>
+          <span class="ftbe-csv-reconcile" id="ftbe-csv-reconcile" hidden></span>
           <button type="button" class="btn btn--ghost btn--sm" id="ftbe-legend-help" aria-label="Cell colour legend" title="What do the colours mean?">?</button>
         </div>
 
@@ -272,6 +273,7 @@
           </span>
           <button type="button" class="btn btn--sm" id="ftbe-dup-review">Review duplicates</button>
           <button type="button" class="btn btn--sm" id="ftbe-dup-export">Export duplicate rows</button>
+          <button type="button" class="btn btn--ghost btn--sm" id="ftbe-dup-dismiss" aria-label="Dismiss duplicates warning" title="Dismiss this warning">×</button>
         </div>
 
         <!-- Suggested next steps. Renders after a CSV match completes. -->
