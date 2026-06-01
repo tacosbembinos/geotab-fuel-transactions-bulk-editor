@@ -1515,10 +1515,12 @@ geotab.addin.fuelBulkEditor = function () {
     const patch = ui.edited.get(id) || {};
     const cur = (k) => patch[k] != null ? patch[k] : row[k];
     const body = $('ftbe-modal-body');
+    const curCurrency = cur('currencyCode') || '';
     body.innerHTML =
       '<div class="addin-form-grid">' +
         '<label class="addin-field"><span>Date / time</span>' +
-          '<input type="datetime-local" id="ftbe-edit-dateTime" value="' + escapeHtml(isoToLocalInput(cur('dateTime'))) + '"></label>' +
+          '<input type="datetime-local" id="ftbe-edit-dateTime" value="' + escapeHtml(isoToLocalInput(cur('dateTime'))) + '">' +
+          '<small class="addin-field__hint">Stored as UTC.</small></label>' +
         '<label class="addin-field"><span>Product</span>' +
           '<select id="ftbe-edit-productType">' +
             PRODUCT_TYPES.map((p) => '<option value="' + escapeHtml(p) + '"' +
@@ -1526,23 +1528,48 @@ geotab.addin.fuelBulkEditor = function () {
           '</select></label>' +
         '<label class="addin-field"><span>Volume (' + escapeHtml(ui.volUnit) + ')</span>' +
           '<input type="number" step="0.001" min="0" id="ftbe-edit-volume" value="' +
-          escapeHtml(cur('volume') != null ? fmtNum(toDisplayVolume(cur('volume')), 3) : '') + '"></label>' +
-        '<label class="addin-field"><span>Cost</span>' +
+          escapeHtml(cur('volume') != null ? fmtNum(toDisplayVolume(cur('volume')), 3) : '') + '">' +
+          '<small class="addin-field__hint" id="ftbe-edit-volume-canon" data-canon-unit="L"></small></label>' +
+        '<label class="addin-field"><span>Cost' + (curCurrency ? ' (' + escapeHtml(curCurrency) + ')' : '') + '</span>' +
           '<input type="number" step="0.01" min="0" id="ftbe-edit-cost" value="' +
           escapeHtml(cur('cost') != null ? fmtNum(cur('cost'), 2) : '') + '"></label>' +
         '<label class="addin-field"><span>Currency</span>' +
           '<select id="ftbe-edit-currencyCode">' +
             CURRENCIES.map((c) => '<option value="' + escapeHtml(c) + '"' +
               (cur('currencyCode') === c ? ' selected' : '') + '>' + escapeHtml(c) + '</option>').join('') +
-          '</select></label>' +
+          '</select>' +
+          '<small class="addin-field__hint">Label only. Changing the code does not convert the amount.</small></label>' +
         '<label class="addin-field"><span>Odometer (' + escapeHtml(ui.odoUnit) + ')</span>' +
           '<input type="number" step="1" min="0" id="ftbe-edit-odometer" value="' +
-          escapeHtml(cur('odometer') != null ? fmtNum(toDisplayOdo(cur('odometer')), 0) : '') + '"></label>' +
+          escapeHtml(cur('odometer') != null ? fmtNum(toDisplayOdo(cur('odometer')), 0) : '') + '">' +
+          '<small class="addin-field__hint" id="ftbe-edit-odometer-canon" data-canon-unit="km"></small></label>' +
         '<label class="addin-field full"><span>Comments</span>' +
           '<textarea id="ftbe-edit-comments" rows="3" maxlength="1024">' +
           escapeHtml(cur('comments') || '') + '</textarea></label>' +
       '</div>';
     $('ftbe-modal-title').textContent = 'Edit transaction';
+    // Wire the canonical-preview hints (volume → L, odometer → km).
+    const volInputEl = $('ftbe-edit-volume');
+    const odoInputEl = $('ftbe-edit-odometer');
+    const volHintEl  = $('ftbe-edit-volume-canon');
+    const odoHintEl  = $('ftbe-edit-odometer-canon');
+    function refreshEditCanon() {
+      if (volHintEl) {
+        const v = volInputEl.value;
+        volHintEl.textContent = v === ''
+          ? 'Stored in Liters.'
+          : '= ' + Number(fromDisplayVolume(Number(v))).toFixed(3) + ' L (stored)';
+      }
+      if (odoHintEl) {
+        const v = odoInputEl.value;
+        odoHintEl.textContent = v === ''
+          ? 'Stored in kilometers.'
+          : '= ' + Number(fromDisplayOdo(Number(v))).toFixed(0) + ' km (stored)';
+      }
+    }
+    if (volInputEl) volInputEl.addEventListener('input', refreshEditCanon);
+    if (odoInputEl) odoInputEl.addEventListener('input', refreshEditCanon);
+    refreshEditCanon();
     showModal(() => {
       const raw = {
         dateTime:     localInputToIso($('ftbe-edit-dateTime').value),
@@ -1557,16 +1584,39 @@ geotab.addin.fuelBulkEditor = function () {
       const existing = ui.edited.get(id) || {};
       ui.edited.set(id, Object.assign({}, existing, clean));
       renderTable();
-    });
+    }, false, 'Stage changes');
   }
 
   // ── Bulk-edit modal ──────────────────────────────────────────────────────
   function openBulkEditModal() {
     if (!ui.selected.size) return;
     const body = $('ftbe-modal-body');
+    // Surface the currency context of the selection. If every selected row
+    // already has the same currencyCode, that's the cost label; otherwise
+    // we warn that the cost numeric will be saved as-is per row (no FX).
+    const selectedRows = ui.rows.filter((r) => ui.selected.has(r.id));
+    const currencyCounts = selectedRows.reduce((acc, r) => {
+      const c = r.currencyCode || '';
+      acc[c] = (acc[c] || 0) + 1;
+      return acc;
+    }, {});
+    const distinctCurrencies = Object.keys(currencyCounts).filter((c) => c);
+    const dominantCurrency = distinctCurrencies.length === 1 ? distinctCurrencies[0] : '';
+    const costLabel = dominantCurrency
+      ? 'Set cost (' + dominantCurrency + ')'
+      : (distinctCurrencies.length > 1 ? 'Set cost (mixed currencies)' : 'Set cost');
     body.innerHTML =
       '<p>Apply changes to <b>' + ui.selected.size + '</b> selected transaction(s). ' +
-        'Leave a field blank to leave it unchanged.</p>' +
+        'Leave a field blank to leave it unchanged. Nothing is sent to Geotab until you click ' +
+        '<b>Commit</b> on the pending-edits pill.</p>' +
+      (distinctCurrencies.length > 1
+        ? '<p class="addin-import-summary" style="margin-bottom:8px">' +
+            '⚠ Selected rows use ' + distinctCurrencies.length + ' currencies (' +
+            escapeHtml(distinctCurrencies.join(', ')) + '). ' +
+            'A "Set cost" value is saved as-is on every row; amounts are <em>not</em> FX-converted. ' +
+            'A "Currency" change relabels rows without altering the numeric.' +
+          '</p>'
+        : '') +
       '<div class="addin-form-grid">' +
         '<label class="addin-field"><span>Product</span>' +
           '<select id="ftbe-bulk-productType"><option value="">— unchanged —</option>' +
@@ -1575,17 +1625,40 @@ geotab.addin.fuelBulkEditor = function () {
         '<label class="addin-field"><span>Currency</span>' +
           '<select id="ftbe-bulk-currencyCode"><option value="">— unchanged —</option>' +
             CURRENCIES.map((c) => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('') +
-          '</select></label>' +
+          '</select>' +
+          '<small class="addin-field__hint">Label only. Does not convert costs.</small></label>' +
         '<label class="addin-field"><span>Set volume (' + escapeHtml(ui.volUnit) + ')</span>' +
-          '<input type="number" step="0.001" min="0" id="ftbe-bulk-volume"></label>' +
-        '<label class="addin-field"><span>Set cost</span>' +
+          '<input type="number" step="0.001" min="0" id="ftbe-bulk-volume">' +
+          '<small class="addin-field__hint" id="ftbe-bulk-volume-canon">Stored in Liters.</small></label>' +
+        '<label class="addin-field"><span>' + escapeHtml(costLabel) + '</span>' +
           '<input type="number" step="0.01" min="0" id="ftbe-bulk-cost"></label>' +
         '<label class="addin-field"><span>Set odometer (' + escapeHtml(ui.odoUnit) + ')</span>' +
-          '<input type="number" step="1" min="0" id="ftbe-bulk-odometer"></label>' +
+          '<input type="number" step="1" min="0" id="ftbe-bulk-odometer">' +
+          '<small class="addin-field__hint" id="ftbe-bulk-odometer-canon">Stored in kilometers.</small></label>' +
         '<label class="addin-field full"><span>Append to comments</span>' +
           '<input type="text" id="ftbe-bulk-comments-append" maxlength="512"></label>' +
       '</div>';
     $('ftbe-modal-title').textContent = 'Bulk edit ' + ui.selected.size + ' transaction(s)';
+    const bVolEl = $('ftbe-bulk-volume');
+    const bOdoEl = $('ftbe-bulk-odometer');
+    const bVolHint = $('ftbe-bulk-volume-canon');
+    const bOdoHint = $('ftbe-bulk-odometer-canon');
+    function refreshBulkCanon() {
+      if (bVolHint) {
+        const v = bVolEl.value;
+        bVolHint.textContent = v === ''
+          ? 'Stored in Liters.'
+          : '= ' + Number(fromDisplayVolume(Number(v))).toFixed(3) + ' L (stored)';
+      }
+      if (bOdoHint) {
+        const v = bOdoEl.value;
+        bOdoHint.textContent = v === ''
+          ? 'Stored in kilometers.'
+          : '= ' + Number(fromDisplayOdo(Number(v))).toFixed(0) + ' km (stored)';
+      }
+    }
+    if (bVolEl) bVolEl.addEventListener('input', refreshBulkCanon);
+    if (bOdoEl) bOdoEl.addEventListener('input', refreshBulkCanon);
     showModal(() => {
       const raw = {
         productType:  $('ftbe-bulk-productType').value,
@@ -1609,7 +1682,7 @@ geotab.addin.fuelBulkEditor = function () {
         ui.edited.set(id, merged);
       });
       renderTable();
-    });
+    }, false, 'Stage changes');
   }
 
   // ── Save pending edits (multiCall, sequential, optimistic concurrency) ───
@@ -1859,7 +1932,7 @@ geotab.addin.fuelBulkEditor = function () {
       if (next.tzMode === 'iana' && !next.tzIana) { next.tzMode = 'browser'; }
       ui.csvImport = next;
       onImportFileChosen(file, mode, next);
-    });
+    }, false, 'Continue');
     // Wire conditional IANA-field visibility once the modal is in the DOM.
     const tzModeEl = $('ftbe-csvopt-tzMode');
     if (tzModeEl) {
@@ -2603,7 +2676,12 @@ geotab.addin.fuelBulkEditor = function () {
     modalTrapHandler = null;
   }
 
-  function showModal(onSave, infoOnly) {
+  // saveLabel (PR-4): override the default "Save" text on the primary
+  // button. Modals that only stage UI state (Edit / Bulk edit / CSV import
+  // options) pass "Stage changes" / "Continue" so the user is told plainly
+  // that nothing is being sent to Geotab yet — the floating pill is what
+  // commits.
+  function showModal(onSave, infoOnly, saveLabel) {
     const modal = $('ftbe-modal');
     if (!modal) return;
     ui.lastFocusEl = document.activeElement;
@@ -2615,6 +2693,7 @@ geotab.addin.fuelBulkEditor = function () {
       saveBtn.style.display = 'none';
     } else {
       saveBtn.style.display = '';
+      saveBtn.textContent = saveLabel || 'Save';
       saveBtn.onclick = () => {
         try { if (onSave) onSave(); } finally { hideModal(); }
       };
@@ -2636,7 +2715,7 @@ geotab.addin.fuelBulkEditor = function () {
     const panel = modal.querySelector('.addin-modal__panel');
     if (panel) panel.classList.remove('addin-modal__panel--wide');
     const saveBtn = $('ftbe-modal-save');
-    if (saveBtn) saveBtn.onclick = null;
+    if (saveBtn) { saveBtn.onclick = null; saveBtn.textContent = 'Save'; }
     if (ui.lastFocusEl && typeof ui.lastFocusEl.focus === 'function') {
       try { ui.lastFocusEl.focus(); } catch (_) {}
     }

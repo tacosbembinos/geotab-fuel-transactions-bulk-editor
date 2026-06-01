@@ -1359,6 +1359,18 @@
 }
 .addin-root .ftbe-tz-chip__icon { line-height: 1; }
 .addin-root .ftbe-tz-chip strong { color: var(--zen-text-primary); font-weight: 600; }
+
+/* ── Form-field hints ───────────────────────────────────────────────
+   The muted helper line under inputs in the Edit / Bulk-edit / CSV
+   import modals. Carries the canonical-storage preview (e.g.
+   "= 160.871 L (stored)") and unit/timezone reminders. */
+.addin-root .addin-field__hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.78em;
+  color: var(--zen-text-muted);
+  line-height: 1.3;
+}
 @media (prefers-reduced-motion: reduce) {
   .addin-root .ftbe-action-bar { animation: none; }
   .addin-root .zen-step-panel__chevron { transition: none; }
