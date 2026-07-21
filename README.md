@@ -11,7 +11,7 @@ Geotab-assigned `id` and concurrency `version`.
 2. Paste this JSON into **Configuration**:
 
    ```json
-   
+   {
   "name": "Fuel Transactions Bulk Editor",
   "supportEmail": "abembridge@advtracking.net",
   "version": "1.6.1",
