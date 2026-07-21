@@ -11,7 +11,22 @@ Geotab-assigned `id` and concurrency `version`.
 2. Paste this JSON into **Configuration**:
 
    ```json
-   { "url": "https://raw.githubusercontent.com/tacosbembinos/geotab-fuel-transactions-bulk-editor/main/manifest.json" }
+   
+  "name": "Fuel Transactions Bulk Editor",
+  "supportEmail": "abembridge@advtracking.net",
+  "version": "1.6.1",
+  "items": [
+    {
+      "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.1/fuelBulkEditor.html",
+      "path": "SustainabilityId/",
+      "menuName": { "en": "Fuel Transactions Bulk Editor" },
+      "icon": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.1/images/icon.svg",
+      "menuHeader": false,
+      "securityIds": []
+    }
+  ],
+  "isSigned": false
+}
    ```
 
 3. Save. The menu item appears under **Engine & Maintenance**.
