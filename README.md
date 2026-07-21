@@ -8,27 +8,7 @@ Geotab-assigned `id` and concurrency `version`.
 ## Install in MyGeotab
 
 1. Administration → **System** → **System Settings** → **Add-Ins** → **New Add-In**.
-2. Paste this JSON into **Configuration**:
-
-   ```json
-   {
-  "name": "Fuel Transactions Bulk Editor",
-  "supportEmail": "abembridge@advtracking.net",
-  "version": "1.6.1",
-  "items": [
-    {
-      "url": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.1/fuelBulkEditor.html",
-      "path": "SustainabilityId/",
-      "menuName": { "en": "Fuel Transactions Bulk Editor" },
-      "icon": "https://cdn.jsdelivr.net/gh/tacosbembinos/geotab-fuel-transactions-bulk-editor@v1.6.1/images/icon.svg",
-      "menuHeader": false,
-      "securityIds": []
-    }
-  ],
-  "isSigned": false
-}
-   ```
-
+2. Paste this contents of the config.JSON into **Configuration**:
 3. Save. The menu item appears under **Engine & Maintenance**.
 
 ## Hosting layout
